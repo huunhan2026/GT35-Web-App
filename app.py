@@ -275,50 +275,94 @@ def input_page(user):
 
 def import_excel_page(user):
     st.header("Nhập từ file Excel đúng mẫu")
+    st.write("Sau khi chọn file, hệ thống sẽ hiển thị toàn bộ dữ liệu theo từng nhóm của sheet 02 INPUT DATA.")
     with open("Mau Input Data GT35.xlsx","rb") as f:
         st.download_button("Tải file mẫu gốc",f.read(),"Mau Input Data GT35.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     uploaded=st.file_uploader("Chọn file GT35 Excel",type=["xlsx"])
-    if not uploaded: return
-    book=load_workbook(uploaded,data_only=True)
+    if not uploaded:
+        return
+
+    try:
+        book=load_workbook(uploaded,data_only=True)
+    except Exception as e:
+        st.error(f"Không đọc được file Excel: {e}")
+        return
+
     if "02 INPUT DATA" not in book.sheetnames:
         st.error("Không tìm thấy sheet '02 INPUT DATA'.")
         return
+
     sh=book["02 INPUT DATA"]
     headers=[sh.cell(3,c).value for c in range(1,sh.max_column+1)]
-    preview=[]
     rows=[]
     for r in range(4,sh.max_row+1):
         values=[sh.cell(r,c).value for c in range(1,sh.max_column+1)]
-        if not any(v not in (None,"") for v in values): continue
-        record={}
-        for c,(h,v) in enumerate(zip(headers,values),1):
+        if not any(v not in (None,"") for v in values):
+            continue
+        record={f["key"]: None for f in FIELD_DEFS}
+        for h,v in zip(headers,values):
             if h and str(h).strip() in KEY_BY_VI:
                 record[KEY_BY_VI[str(h).strip()]]=v
-        record=recalculate(record)
-        rows.append(record)
-        preview.append({
-            "Năm":record.get(KEY_BY_VI.get("Năm")),
-            "Tuần":record.get(KEY_BY_VI.get("Tuần")),
-            "Trại":record.get(KEY_BY_VI.get("Trại"))
+        rows.append(recalculate(record))
+
+    if not rows:
+        st.warning("File không có dòng dữ liệu trong sheet 02 INPUT DATA.")
+        return
+
+    # Tóm tắt nhanh
+    summary=[]
+    for record in rows:
+        summary.append({
+            "Năm": record.get(KEY_BY_VI.get("Năm")),
+            "Tháng": record.get(KEY_BY_VI.get("Tháng")),
+            "Tuần": record.get(KEY_BY_VI.get("Tuần")),
+            "Khu vực": record.get(KEY_BY_VI.get("Khu vực")),
+            "Trại": record.get(KEY_BY_VI.get("Trại")),
         })
-    st.dataframe(pd.DataFrame(preview),use_container_width=True,hide_index=True)
-    if st.button("Nhập toàn bộ các dòng",type="primary"):
-        ok_count=0; errors=[]
+    st.success(f"Đã đọc {len(rows)} dòng và {len(FIELD_DEFS)} cột dữ liệu.")
+    st.subheader("Kiểm tra tổng quan")
+    st.dataframe(pd.DataFrame(summary),use_container_width=True,hide_index=True,height=300)
+
+    # Hiển thị toàn bộ dữ liệu theo từng nhóm/tab
+    st.subheader("Dữ liệu chi tiết theo nhóm")
+    tabs=st.tabs(GROUP_ORDER)
+    for tab,group in zip(tabs,GROUP_ORDER):
+        with tab:
+            fields=[f for f in FIELD_DEFS if f["group"]==group]
+            group_data=[]
+            for record in rows:
+                group_data.append({f["vi"]: record.get(f["key"]) for f in fields})
+            group_df=pd.DataFrame(group_data)
+            st.caption(f"{len(fields)} cột • {len(group_df)} dòng")
+            st.dataframe(group_df,use_container_width=True,hide_index=True,height=420)
+
+    st.divider()
+    confirm=st.checkbox("Tôi đã kiểm tra dữ liệu và đồng ý nhập toàn bộ vào hệ thống")
+    if st.button("NHẬP TOÀN BỘ DỮ LIỆU",type="primary",use_container_width=True,disabled=not confirm):
+        ok_count=0
+        errors=[]
         for record in rows:
-            year=int(val(record,"Năm",0)); month=int(val(record,"Tháng",0))
+            year=int(val(record,"Năm",0))
+            month=int(val(record,"Tháng",0))
             week=str(record.get(KEY_BY_VI.get("Tuần")) or "").replace(".0","")
-            farm=str(record.get(KEY_BY_VI.get("Trại")) or "")
-            region=str(record.get(KEY_BY_VI.get("Khu vực")) or "")
+            farm=str(record.get(KEY_BY_VI.get("Trại")) or "").strip()
+            region=str(record.get(KEY_BY_VI.get("Khu vực")) or "").strip()
             if not year or not week or not farm:
                 errors.append(f"Thiếu Năm/Tuần/Trại: {farm}-{week}")
                 continue
-            ok,msg=save_record({"year":year,"month":month,"week":week,"region":region,"farm":farm},
-                               record,user.get("email","unknown"),"Đã gửi")
-            if ok: ok_count+=1
-            else: errors.append(msg)
-        if errors: st.warning(f"Đã nhập {ok_count} dòng; lỗi {len(errors)} dòng. {errors[0]}")
-        else: st.success(f"Đã nhập thành công {ok_count} dòng.")
+            ok,msg=save_record(
+                {"year":year,"month":month,"week":week,"region":region,"farm":farm},
+                record,user.get("email","unknown"),"Đã gửi"
+            )
+            if ok:
+                ok_count+=1
+            else:
+                errors.append(msg)
+        if errors:
+            st.warning(f"Đã nhập {ok_count} dòng; lỗi {len(errors)} dòng. Lỗi đầu tiên: {errors[0]}")
+        else:
+            st.success(f"Đã nhập thành công {ok_count} dòng với toàn bộ {len(FIELD_DEFS)} cột.")
 
 def records_page(user):
     st.header("Dữ liệu và báo cáo")
@@ -411,7 +455,7 @@ def main():
     if not user:
         login_page(); return
     with st.sidebar:
-        st.markdown("## 🐷 GT35 WEB V3")
+        st.markdown("## 🐷 GT35 WEB V4")
         st.write(f"**{user.get('email')}**")
         st.caption(f"Vai trò: {user.get('role','user')}")
         page=st.radio("Chức năng",[
@@ -424,7 +468,7 @@ def main():
             logout_user(); st.rerun()
 
     st.markdown('<div class="main-title">GT35 – Quản lý trại hậu bị</div>',unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">Đầu vào theo đúng 14 nhóm của sheet 02 INPUT DATA</div>',unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">Đầu vào đầy đủ theo các nhóm của sheet 02 INPUT DATA</div>',unsafe_allow_html=True)
     if page=="Dashboard": dashboard_page()
     elif page=="Nhập liệu Input Data": input_page(user)
     elif page=="Nhập từ Excel": import_excel_page(user)
