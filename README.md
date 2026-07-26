@@ -1,4 +1,4 @@
-# GT35 WEB V3
+# GT35 WEB V4
 
 Phiên bản này đọc đúng cấu trúc file **GT35 Theo doi du lieu Dashboard3.xlsx**:
 
@@ -23,3 +23,8 @@ Tài khoản:
 3. Tạo user trong Authentication.
 4. Cập nhật `profiles.role` và `profiles.farm`.
 5. Đưa mã lên GitHub và khai báo Secrets trên Streamlit Cloud.
+
+
+## Điểm mới V4
+- Trang Nhập từ Excel hiển thị toàn bộ 133 cột theo từng tab/nhóm, không còn chỉ xem 3 cột Năm–Tuần–Trại.
+- Có bước xác nhận trước khi nhập toàn bộ dữ liệu vào Supabase.
