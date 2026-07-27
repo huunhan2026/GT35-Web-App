@@ -886,18 +886,42 @@ def dashboard_page():
 
 
 def _ai_prepare_cost_data(df):
-    """Chuẩn hóa dữ liệu phục vụ dự báo, không làm thay đổi dữ liệu gốc."""
+    """
+    Chuẩn hóa dữ liệu cho AI Platform mà không thay đổi dữ liệu gốc.
+
+    Ưu tiên dùng cột "Giá thành/kg" đã lưu. Nếu cột này trống,
+    hệ thống tự tính giống Dashboard: Tổng chi phí / Số heo xuất.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
+
     cost_key = KEY_BY_VI.get("Giá thành/kg")
+    total_cost_key = KEY_BY_VI.get("Tổng chi phí")
+    output_key = KEY_BY_VI.get("Số heo xuất")
     baseline_key = KEY_BY_VI.get("Giá thành cơ sở/kg")
 
-    if not cost_key or cost_key not in out.columns:
-        return pd.DataFrame()
+    stored_cost = pd.Series(np.nan, index=out.index, dtype=float)
+    if cost_key and cost_key in out.columns:
+        stored_cost = pd.to_numeric(out[cost_key], errors="coerce")
 
-    out["_cost_per_kg"] = pd.to_numeric(out[cost_key], errors="coerce")
+    calculated_cost = pd.Series(np.nan, index=out.index, dtype=float)
+    if (
+        total_cost_key and total_cost_key in out.columns
+        and output_key and output_key in out.columns
+    ):
+        total_cost = pd.to_numeric(out[total_cost_key], errors="coerce")
+        output_pigs = pd.to_numeric(out[output_key], errors="coerce")
+        calculated_cost = total_cost.div(output_pigs.where(output_pigs > 0))
+
+    out["_cost_per_kg"] = stored_cost.fillna(calculated_cost)
+    out["_cost_source"] = np.where(
+        stored_cost.notna(),
+        "Giá thành/kg đã lưu",
+        np.where(calculated_cost.notna(), "Tổng chi phí / Số heo xuất", "Không có")
+    )
+
     if baseline_key and baseline_key in out.columns:
         out["_baseline_per_kg"] = pd.to_numeric(out[baseline_key], errors="coerce")
     else:
@@ -907,22 +931,32 @@ def _ai_prepare_cost_data(df):
         out["_year"] = pd.to_numeric(out["year"], errors="coerce")
     else:
         year_key = KEY_BY_VI.get("Năm")
-        out["_year"] = pd.to_numeric(out.get(year_key), errors="coerce")
+        if year_key and year_key in out.columns:
+            out["_year"] = pd.to_numeric(out[year_key], errors="coerce")
+        else:
+            out["_year"] = np.nan
 
     if "week" in out.columns:
         out["_week"] = pd.to_numeric(out["week"], errors="coerce")
     else:
         week_key = KEY_BY_VI.get("Tuần")
-        out["_week"] = pd.to_numeric(out.get(week_key), errors="coerce")
+        if week_key and week_key in out.columns:
+            out["_week"] = pd.to_numeric(out[week_key], errors="coerce")
+        else:
+            out["_week"] = np.nan
 
     if "farm" not in out.columns:
         farm_key = KEY_BY_VI.get("Trại")
-        out["farm"] = out.get(farm_key, "")
+        if farm_key and farm_key in out.columns:
+            out["farm"] = out[farm_key]
+        else:
+            out["farm"] = "Không xác định"
 
+    out["farm"] = out["farm"].fillna("Không xác định").astype(str)
+    out = out.replace([np.inf, -np.inf], np.nan)
     out = out.dropna(subset=["_cost_per_kg", "_year", "_week"])
-    out = out[out["_cost_per_kg"] >= 0]
+    out = out[out["_cost_per_kg"] > 0]
     return out
-
 
 def _ai_weekly_cost(df):
     if df is None or df.empty:
@@ -1041,26 +1075,90 @@ def ai_platform_page(user):
 
     st.header("🤖 AI Platform – Dự báo chi phí GT35")
     st.caption(
-        "Dự báo xu hướng giá thành/kg từ dữ liệu đã lưu. "
+        "Admin chủ động bấm nút AI để đọc dữ liệu đã lưu và thực hiện phân tích. "
         "Mục tiêu GT35: mức giảm so với baseline ≥ 35.000 VND/kg."
     )
 
-    raw = load_records()
-    data = _ai_prepare_cost_data(raw)
-    if data.empty:
-        st.warning("Chưa có dữ liệu Giá thành/kg hợp lệ để phân tích.")
+    st.markdown("### Trợ lý phân tích GT35")
+    run_ai = st.button(
+        "🤖 YÊU CẦU AI PHÂN TÍCH",
+        type="primary",
+        use_container_width=True,
+        key="run_gt35_ai"
+    )
+
+    if not run_ai:
+        st.info(
+            "Bấm **YÊU CẦU AI PHÂN TÍCH** để hệ thống đọc dữ liệu Dashboard, "
+            "dự báo tổng toàn bộ trại hoặc từng trại."
+        )
         return
+
+    with st.spinner("AI đang đọc dữ liệu và chuẩn bị phân tích..."):
+        raw = load_records()
+
+        if raw is None or raw.empty:
+            st.warning("Hệ thống chưa có dữ liệu đã lưu.")
+            return
+
+        data = _ai_prepare_cost_data(raw)
+
+    if data.empty:
+        st.error(
+            "AI chưa tạo được dữ liệu giá thành theo tuần. "
+            "Cần có Năm, Tuần và một trong hai nguồn: "
+            "Giá thành/kg hoặc Tổng chi phí cùng Số heo xuất."
+        )
+        with st.expander("Kiểm tra dữ liệu AI đang đọc"):
+            st.write(f"Tổng số bản ghi load_records(): **{len(raw)}**")
+            checks = []
+            for vi_name in [
+                "Giá thành/kg", "Tổng chi phí", "Số heo xuất",
+                "Giá thành cơ sở/kg", "Năm", "Tuần", "Trại"
+            ]:
+                key = KEY_BY_VI.get(vi_name)
+                checks.append({
+                    "Chỉ tiêu": vi_name,
+                    "Key trong FIELD_DEFS": key or "Không tìm thấy",
+                    "Có cột trong dữ liệu": bool(key and key in raw.columns),
+                    "Số giá trị có dữ liệu": (
+                        int(raw[key].notna().sum()) if key and key in raw.columns else 0
+                    )
+                })
+            st.dataframe(pd.DataFrame(checks), use_container_width=True, hide_index=True)
+            st.write("Các cột thực tế:")
+            st.code(", ".join(map(str, raw.columns.tolist())))
+        return
+
+    st.success(f"AI đã đọc thành công {len(data)} bản ghi hợp lệ.")
+
+    source_summary = (
+        data["_cost_source"]
+        .value_counts(dropna=False)
+        .rename_axis("Nguồn")
+        .reset_index(name="Số bản ghi")
+    )
+    with st.expander("Nguồn dữ liệu Giá thành/kg AI đang sử dụng"):
+        st.dataframe(source_summary, use_container_width=True, hide_index=True)
 
     c1, c2, c3 = st.columns(3)
     years = sorted(data["_year"].dropna().astype(int).unique().tolist(), reverse=True)
     selected_year = c1.selectbox("Năm phân tích", ["Tất cả"] + years, key="ai_year")
     forecast_weeks = c2.selectbox("Số tuần dự báo", [1, 2, 4, 8], index=2, key="ai_weeks")
     target_saving = c3.number_input(
-        "Mục tiêu giảm (VND/kg)", min_value=0.0, value=35000.0, step=1000.0, key="ai_target"
+        "Mục tiêu giảm (VND/kg)",
+        min_value=0.0,
+        value=35000.0,
+        step=1000.0,
+        key="ai_target"
     )
 
     if selected_year != "Tất cả":
         data = data[data["_year"] == int(selected_year)]
+
+    if data.empty:
+        st.warning("Không có dữ liệu phù hợp với năm đã chọn.")
+        return
 
     scope = st.radio(
         "Phạm vi phân tích",
@@ -1105,7 +1203,9 @@ def ai_platform_page(user):
         if ranking.empty:
             st.info("Chưa đủ dữ liệu để lập bảng dự báo từng trại.")
         else:
-            ranking = ranking.sort_values("Giá thành dự báo (đ/kg)", ascending=False, na_position="last")
+            ranking = ranking.sort_values(
+                "Giá thành dự báo (đ/kg)", ascending=False, na_position="last"
+            )
             st.dataframe(
                 ranking.style.format({
                     "Giá thành hiện tại (đ/kg)": "{:,.0f}",
@@ -1134,8 +1234,8 @@ def ai_platform_page(user):
 
     st.divider()
     st.caption(
-        "Lưu ý: Đây là dự báo xu hướng tuyến tính từ dữ liệu lịch sử, dùng để hỗ trợ quyết định. "
-        "Kết quả không tự động sửa dữ liệu hoặc thay thế quyết định của Admin."
+        "Lưu ý: Đây là dự báo xu hướng tuyến tính từ dữ liệu lịch sử để hỗ trợ quyết định. "
+        "AI không tự động sửa hoặc xóa dữ liệu."
     )
 
 def main():
@@ -1146,6 +1246,7 @@ def main():
         login_page(); return
     with st.sidebar:
         st.markdown("## 🐷 GT35 WEB V4")
+        st.caption("Build: AI-BUTTON-20260727-01")
         st.write(f"**{user.get('email')}**")
         st.caption(f"Vai trò: {user.get('role','user')}")
         menu_items=[
