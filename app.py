@@ -459,7 +459,6 @@ def import_excel_page(user):
 def records_page(user):
     st.header("Dữ liệu và báo cáo")
     df=load_records()
-
     if df.empty:
         st.info("Chưa có dữ liệu.")
         return
@@ -477,8 +476,12 @@ def records_page(user):
         )
     )
     week=c3.text_input("Tìm tuần")
-    statuses=sorted(df["status"].dropna().astype(str).unique().tolist()) if "status" in df.columns else []
-    status_filter=c4.selectbox("Trạng thái",["Tất cả"]+statuses)
+    status_options=["Tất cả"]
+    if "status" in df.columns:
+        status_options += sorted(
+            df["status"].dropna().astype(str).unique().tolist()
+        )
+    status_filter=c4.selectbox("Trạng thái",status_options)
 
     view=df.copy()
     if farm!="Tất cả":
@@ -486,30 +489,25 @@ def records_page(user):
     if year!="Tất cả":
         view=view[view["year"].astype(str)==year]
     if week:
-        view=view[view["week"].astype(str).str.contains(week,na=False)]
+        view=view[
+            view["week"].astype(str).str.contains(week,na=False)
+        ]
     if status_filter!="Tất cả" and "status" in view.columns:
-        view=view[view["status"].astype(str)==status_filter]
+        view=view[
+            view["status"].astype(str)==status_filter
+        ]
 
     fixed=[
         "id","year","month","week","region","farm",
         "status","created_by","updated_at"
     ]
     fixed=[c for c in fixed if c in view.columns]
-    data_cols=[f["key"] for f in FIELD_DEFS if f["key"] in view.columns]
+    data_cols=[
+        f["key"] for f in FIELD_DEFS
+        if f["key"] in view.columns
+    ]
     display=view[fixed+data_cols].rename(columns=VI_BY_KEY)
-
-    if "year" in display.columns:
-        display["year"]=pd.to_numeric(display["year"],errors="coerce").apply(
-            lambda x: "" if pd.isna(x) else str(int(x))
-        )
-    if "month" in display.columns:
-        display["month"]=pd.to_numeric(display["month"],errors="coerce").apply(
-            lambda x: "" if pd.isna(x) else str(int(x))
-        )
-    if "week" in display.columns:
-        display["week"]=display["week"].astype(str).str.replace(".0","",regex=False)
-    if "updated_at" in display.columns:
-        display["updated_at"]=display["updated_at"].apply(format_date_ddmmyyyy)
+    display=format_display_table(display)
 
     st.caption(f"Đang hiển thị {len(view)} bản ghi.")
     st.dataframe(
@@ -525,7 +523,11 @@ def records_page(user):
         engine="openpyxl",
         datetime_format="DD/MM/YYYY"
     ) as writer:
-        display.to_excel(writer,index=False,sheet_name="Du lieu GT35")
+        display.to_excel(
+            writer,
+            index=False,
+            sheet_name="Du lieu GT35"
+        )
         ws=writer.book["Du lieu GT35"]
         for cell in ws[1]:
             cell.fill=PatternFill("solid",fgColor="1F6B4A")
@@ -548,10 +550,7 @@ def records_page(user):
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # =====================================================
-    # XÓA DỮ LIỆU - CHỈ ADMIN
-    # =====================================================
-    if user.get("role") == "admin":
+    if user.get("role")=="admin":
         st.divider()
         st.subheader("🗑️ Quản lý xóa dữ liệu — Chỉ Admin")
         st.warning(
@@ -563,10 +562,9 @@ def records_page(user):
             "Chọn cách xóa",
             [
                 "Xóa một bản ghi theo ID",
-                "Xóa toàn bộ dữ liệu nháp đang lọc",
+                "Xóa toàn bộ dữ liệu Nháp đang lọc",
                 "Xóa toàn bộ dữ liệu đang lọc"
             ],
-            horizontal=False,
             key="admin_delete_mode"
         )
 
@@ -575,7 +573,7 @@ def records_page(user):
                 "ID bản ghi cần xóa",
                 min_value=1,
                 step=1,
-                key="delete_one_id"
+                key="delete_record_id"
             )
             confirm_one=st.checkbox(
                 f"Tôi xác nhận xóa bản ghi ID {int(rid)}",
@@ -594,25 +592,25 @@ def records_page(user):
                 else:
                     st.error(msg)
 
-        elif delete_mode=="Xóa toàn bộ dữ liệu nháp đang lọc":
-            if "status" not in view.columns:
-                draft_view=view.iloc[0:0]
-            else:
+        elif delete_mode=="Xóa toàn bộ dữ liệu Nháp đang lọc":
+            if "status" in view.columns:
                 draft_view=view[
                     view["status"].astype(str).str.strip().str.lower()=="nháp"
                 ]
+            else:
+                draft_view=view.iloc[0:0]
 
             st.info(
                 f"Có {len(draft_view)} bản ghi Nháp phù hợp với bộ lọc hiện tại."
             )
 
             confirm_text=st.text_input(
-                'Nhập chính xác chữ "XOA NHAP" để xác nhận',
-                key="confirm_delete_drafts_text"
+                'Nhập chính xác "XOA NHAP" để xác nhận',
+                key="confirm_delete_drafts"
             )
             can_delete=(
-                len(draft_view)>0 and
-                confirm_text.strip().upper()=="XOA NHAP"
+                len(draft_view)>0
+                and confirm_text.strip().upper()=="XOA NHAP"
             )
 
             if st.button(
@@ -633,7 +631,8 @@ def records_page(user):
                 if errors:
                     st.warning(
                         f"Đã xóa {deleted} bản ghi; "
-                        f"có {len(errors)} lỗi. Lỗi đầu tiên: {errors[0]}"
+                        f"có {len(errors)} lỗi. "
+                        f"Lỗi đầu tiên: {errors[0]}"
                     )
                 else:
                     st.success(f"Đã xóa {deleted} bản ghi Nháp.")
@@ -641,27 +640,25 @@ def records_page(user):
 
         else:
             st.error(
-                "Tùy chọn này sẽ xóa tất cả bản ghi đang hiển thị theo "
-                "bộ lọc Trại, Năm, Tuần và Trạng thái."
+                "Tùy chọn này sẽ xóa toàn bộ bản ghi "
+                "đang hiển thị theo bộ lọc hiện tại."
             )
-            st.write(
-                f"Số bản ghi sẽ bị xóa: **{len(view)}**"
-            )
+            st.write(f"Số bản ghi sẽ bị xóa: **{len(view)}**")
 
             confirm_text=st.text_input(
-                'Nhập chính xác chữ "XOA TAT CA" để xác nhận',
-                key="confirm_delete_all_text"
+                'Nhập chính xác "XOA TAT CA" để xác nhận',
+                key="confirm_delete_all"
             )
             can_delete=(
-                len(view)>0 and
-                confirm_text.strip().upper()=="XOA TAT CA"
+                len(view)>0
+                and confirm_text.strip().upper()=="XOA TAT CA"
             )
 
             if st.button(
                 f"XÓA {len(view)} BẢN GHI ĐANG LỌC",
                 type="primary",
                 disabled=not can_delete,
-                key="delete_all_filtered_button"
+                key="delete_all_button"
             ):
                 deleted=0
                 errors=[]
@@ -675,60 +672,65 @@ def records_page(user):
                 if errors:
                     st.warning(
                         f"Đã xóa {deleted} bản ghi; "
-                        f"có {len(errors)} lỗi. Lỗi đầu tiên: {errors[0]}"
+                        f"có {len(errors)} lỗi. "
+                        f"Lỗi đầu tiên: {errors[0]}"
                     )
                 else:
                     st.success(f"Đã xóa {deleted} bản ghi.")
                 st.rerun()
-
     else:
-        st.caption(
-            "Chức năng xóa dữ liệu chỉ hiển thị cho tài khoản Admin."
-        )
+        st.caption("Chức năng xóa dữ liệu chỉ dành cho Admin.")
 
 def dashboard_page():
     st.header("Dashboard GT35")
 
     df = load_records()
+
+    # Luôn hiển thị Dashboard tổng hợp và 14 hạng mục, kể cả khi chưa có dữ liệu.
+    # Khi chưa có bản ghi, mỗi phần sẽ báo "Chưa có dữ liệu" thay vì dừng toàn trang.
     if df.empty:
-        st.info("Chưa có dữ liệu.")
-        return
+        st.info(
+            "Chưa có bản ghi đã lưu trong hệ thống. "
+            "Hãy vào 'Nhập từ Excel', đánh dấu xác nhận và bấm "
+            "'NHẬP TOÀN BỘ DỮ LIỆU', hoặc lưu phiếu tại 'Nhập liệu Input Data'."
+        )
+        df = pd.DataFrame()
 
     c1, c2 = st.columns(2)
-    farm = c1.selectbox(
-        "Lọc trại",
-        ["Tất cả"] + sorted(
-            df["farm"].dropna().astype(str).unique().tolist()
-        ),
-        key="dfarm"
-    )
-    year = c2.selectbox(
-        "Lọc năm",
-        ["Tất cả"] + sorted(
-            df["year"].dropna().astype(str).unique().tolist(),
-            reverse=True
-        ),
-        key="dyear"
-    )
+    farm_options = ["Tất cả"]
+    year_options = ["Tất cả"]
+    if not df.empty:
+        if "farm" in df.columns:
+            farm_options += sorted(df["farm"].dropna().astype(str).unique().tolist())
+        if "year" in df.columns:
+            year_options += sorted(
+                df["year"].dropna().astype(str).unique().tolist(), reverse=True
+            )
+
+    farm = c1.selectbox("Lọc trại", farm_options, key="dfarm")
+    year = c2.selectbox("Lọc năm", year_options, key="dyear")
 
     view = df.copy()
-    if farm != "Tất cả":
-        view = view[view["farm"].astype(str) == farm]
-    if year != "Tất cả":
-        view = view[view["year"].astype(str) == year]
-
-    if view.empty:
-        st.warning("Không có dữ liệu phù hợp với bộ lọc.")
-        return
+    if not view.empty:
+        if farm != "Tất cả" and "farm" in view.columns:
+            view = view[view["farm"].astype(str) == farm]
+        if year != "Tất cả" and "year" in view.columns:
+            view = view[view["year"].astype(str) == year]
 
     module_groups = [
         g for g in GROUP_ORDER
         if "THÔNG TIN CHUNG" not in g.upper()
-    ]
+    ][:14]
 
     tabs = st.tabs(["TỔNG HỢP"] + module_groups)
 
     with tabs[0]:
+        if view.empty:
+            st.warning(
+                "Dashboard đang hiển thị cấu trúc báo cáo. "
+                "Chưa có dữ liệu đã lưu để tính kết quả tổng hợp."
+            )
+
         output = sum_if_available(view, "Số heo xuất")
         total_cost = sum_if_available(view, "Tổng chi phí")
         feed = sum_if_available(view, "Lượng cám sử dụng (kg)")
