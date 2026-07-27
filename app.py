@@ -501,45 +501,52 @@ def dashboard_page():
     st.header("Dashboard GT35")
 
     df = load_records()
+
+    # Luôn hiển thị Dashboard tổng hợp và 14 hạng mục, kể cả khi chưa có dữ liệu.
+    # Khi chưa có bản ghi, mỗi phần sẽ báo "Chưa có dữ liệu" thay vì dừng toàn trang.
     if df.empty:
-        st.info("Chưa có dữ liệu.")
-        return
+        st.info(
+            "Chưa có bản ghi đã lưu trong hệ thống. "
+            "Hãy vào 'Nhập từ Excel', đánh dấu xác nhận và bấm "
+            "'NHẬP TOÀN BỘ DỮ LIỆU', hoặc lưu phiếu tại 'Nhập liệu Input Data'."
+        )
+        df = pd.DataFrame()
 
     c1, c2 = st.columns(2)
-    farm = c1.selectbox(
-        "Lọc trại",
-        ["Tất cả"] + sorted(
-            df["farm"].dropna().astype(str).unique().tolist()
-        ),
-        key="dfarm"
-    )
-    year = c2.selectbox(
-        "Lọc năm",
-        ["Tất cả"] + sorted(
-            df["year"].dropna().astype(str).unique().tolist(),
-            reverse=True
-        ),
-        key="dyear"
-    )
+    farm_options = ["Tất cả"]
+    year_options = ["Tất cả"]
+    if not df.empty:
+        if "farm" in df.columns:
+            farm_options += sorted(df["farm"].dropna().astype(str).unique().tolist())
+        if "year" in df.columns:
+            year_options += sorted(
+                df["year"].dropna().astype(str).unique().tolist(), reverse=True
+            )
+
+    farm = c1.selectbox("Lọc trại", farm_options, key="dfarm")
+    year = c2.selectbox("Lọc năm", year_options, key="dyear")
 
     view = df.copy()
-    if farm != "Tất cả":
-        view = view[view["farm"].astype(str) == farm]
-    if year != "Tất cả":
-        view = view[view["year"].astype(str) == year]
-
-    if view.empty:
-        st.warning("Không có dữ liệu phù hợp với bộ lọc.")
-        return
+    if not view.empty:
+        if farm != "Tất cả" and "farm" in view.columns:
+            view = view[view["farm"].astype(str) == farm]
+        if year != "Tất cả" and "year" in view.columns:
+            view = view[view["year"].astype(str) == year]
 
     module_groups = [
         g for g in GROUP_ORDER
         if "THÔNG TIN CHUNG" not in g.upper()
-    ]
+    ][:14]
 
     tabs = st.tabs(["TỔNG HỢP"] + module_groups)
 
     with tabs[0]:
+        if view.empty:
+            st.warning(
+                "Dashboard đang hiển thị cấu trúc báo cáo. "
+                "Chưa có dữ liệu đã lưu để tính kết quả tổng hợp."
+            )
+
         output = sum_if_available(view, "Số heo xuất")
         total_cost = sum_if_available(view, "Tổng chi phí")
         feed = sum_if_available(view, "Lượng cám sử dụng (kg)")
