@@ -140,8 +140,8 @@ def recalculate(record):
     other_cost = val(record,"Chi phí khác")
     breeder_rev = val(record,"Doanh thu heo giống")
     meat_rev = val(record,"Doanh thu heo thịt")
-    baseline = val(record,"Giá thành cơ sở/con")
-    target_saving = val(record,"Mục tiêu tiết kiệm (đồng/con)")
+    baseline = val(record,"Giá thành cơ sở/kg")
+    target_saving = val(record,"Mục tiêu tiết kiệm (đồng/kg)")
 
     setv(record,"Chi phí thức ăn/con",safe_div(feed_cost,output_pigs))
     setv(record,"FCR",safe_div(feed,gain))
@@ -575,7 +575,7 @@ def dashboard_page():
             if deaths is not None and intake not in (None, 0)
             else None
         )
-        baseline = mean_if_available(view, "Giá thành cơ sở/con")
+        baseline = mean_if_available(view, "Giá thành cơ sở/kg")
         saving = (
             baseline - cost_per_pig
             if baseline is not None and cost_per_pig is not None
@@ -597,12 +597,12 @@ def dashboard_page():
         if saving is None:
             r3.metric("Kết quả", "Chưa đủ dữ liệu")
         elif saving > 0:
-            r3.metric("Kết quả", f"GIẢM {format_number(saving, 0)} đ/con")
+            r3.metric("Kết quả", f"GIẢM {format_number(saving, 0)} đ/kg")
         elif saving < 0:
-            r3.metric("Kết quả", f"TĂNG {format_number(abs(saving), 0)} đ/con")
+            r3.metric("Kết quả", f"TĂNG {format_number(abs(saving), 0)} đ/kg")
         else:
             r3.metric("Kết quả", "KHÔNG THAY ĐỔI")
-        r4.metric("Mục tiêu", "35.000 đ/con")
+        r4.metric("Mục tiêu", "35.000 đ/kg")
 
         quality_rows = []
         for group in module_groups:
