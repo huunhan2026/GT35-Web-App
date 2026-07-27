@@ -459,94 +459,276 @@ def import_excel_page(user):
 def records_page(user):
     st.header("Dữ liệu và báo cáo")
     df=load_records()
+
     if df.empty:
         st.info("Chưa có dữ liệu.")
         return
-    c1,c2,c3=st.columns(3)
-    farm=c1.selectbox("Trại",["Tất cả"]+sorted(df["farm"].dropna().astype(str).unique().tolist()))
-    year=c2.selectbox("Năm",["Tất cả"]+sorted(df["year"].dropna().astype(str).unique().tolist(),reverse=True))
-    week=c3.text_input("Tìm tuần")
-    view=df.copy()
-    if farm!="Tất cả": view=view[view["farm"].astype(str)==farm]
-    if year!="Tất cả": view=view[view["year"].astype(str)==year]
-    if week: view=view[view["week"].astype(str).str.contains(week,na=False)]
 
-    fixed=["id","year","month","week","region","farm","status","created_by","updated_at"]
+    c1,c2,c3,c4=st.columns(4)
+    farm=c1.selectbox(
+        "Trại",
+        ["Tất cả"]+sorted(df["farm"].dropna().astype(str).unique().tolist())
+    )
+    year=c2.selectbox(
+        "Năm",
+        ["Tất cả"]+sorted(
+            df["year"].dropna().astype(str).unique().tolist(),
+            reverse=True
+        )
+    )
+    week=c3.text_input("Tìm tuần")
+    statuses=sorted(df["status"].dropna().astype(str).unique().tolist()) if "status" in df.columns else []
+    status_filter=c4.selectbox("Trạng thái",["Tất cả"]+statuses)
+
+    view=df.copy()
+    if farm!="Tất cả":
+        view=view[view["farm"].astype(str)==farm]
+    if year!="Tất cả":
+        view=view[view["year"].astype(str)==year]
+    if week:
+        view=view[view["week"].astype(str).str.contains(week,na=False)]
+    if status_filter!="Tất cả" and "status" in view.columns:
+        view=view[view["status"].astype(str)==status_filter]
+
+    fixed=[
+        "id","year","month","week","region","farm",
+        "status","created_by","updated_at"
+    ]
+    fixed=[c for c in fixed if c in view.columns]
     data_cols=[f["key"] for f in FIELD_DEFS if f["key"] in view.columns]
     display=view[fixed+data_cols].rename(columns=VI_BY_KEY)
-    st.dataframe(display,use_container_width=True,hide_index=True,height=480)
+
+    if "year" in display.columns:
+        display["year"]=pd.to_numeric(display["year"],errors="coerce").apply(
+            lambda x: "" if pd.isna(x) else str(int(x))
+        )
+    if "month" in display.columns:
+        display["month"]=pd.to_numeric(display["month"],errors="coerce").apply(
+            lambda x: "" if pd.isna(x) else str(int(x))
+        )
+    if "week" in display.columns:
+        display["week"]=display["week"].astype(str).str.replace(".0","",regex=False)
+    if "updated_at" in display.columns:
+        display["updated_at"]=display["updated_at"].apply(format_date_ddmmyyyy)
+
+    st.caption(f"Đang hiển thị {len(view)} bản ghi.")
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        height=480
+    )
 
     output=io.BytesIO()
-    with pd.ExcelWriter(output,engine="openpyxl") as writer:
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl",
+        datetime_format="DD/MM/YYYY"
+    ) as writer:
         display.to_excel(writer,index=False,sheet_name="Du lieu GT35")
         ws=writer.book["Du lieu GT35"]
         for cell in ws[1]:
             cell.fill=PatternFill("solid",fgColor="1F6B4A")
             cell.font=Font(color="FFFFFF",bold=True)
-            cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+            cell.alignment=Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True
+            )
         ws.freeze_panes="A2"
         for i,col in enumerate(display.columns,1):
-            ws.column_dimensions[get_column_letter(i)].width=min(28,max(12,len(str(col))+2))
-    st.download_button("Xuất Excel theo bộ lọc",output.getvalue(),
-                       f"Bao cao GT35 {datetime.now():%d%m%Y_%H%M}.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if user.get("role") in ("admin","manager"):
-        rid=st.number_input("ID cần xóa",min_value=1,step=1)
-        if st.button("Xóa bản ghi"):
-            ok,msg=delete_record(rid)
-            st.success(msg) if ok else st.error(msg)
-            if ok: st.rerun()
+            ws.column_dimensions[get_column_letter(i)].width=min(
+                28,max(12,len(str(col))+2)
+            )
+
+    st.download_button(
+        "Xuất Excel theo bộ lọc",
+        output.getvalue(),
+        f"Bao cao GT35 {datetime.now():%d%m%Y_%H%M}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # =====================================================
+    # XÓA DỮ LIỆU - CHỈ ADMIN
+    # =====================================================
+    if user.get("role") == "admin":
+        st.divider()
+        st.subheader("🗑️ Quản lý xóa dữ liệu — Chỉ Admin")
+        st.warning(
+            "Dữ liệu đã xóa không thể khôi phục trên web. "
+            "Hãy xuất Excel sao lưu trước khi xóa."
+        )
+
+        delete_mode=st.radio(
+            "Chọn cách xóa",
+            [
+                "Xóa một bản ghi theo ID",
+                "Xóa toàn bộ dữ liệu nháp đang lọc",
+                "Xóa toàn bộ dữ liệu đang lọc"
+            ],
+            horizontal=False,
+            key="admin_delete_mode"
+        )
+
+        if delete_mode=="Xóa một bản ghi theo ID":
+            rid=st.number_input(
+                "ID bản ghi cần xóa",
+                min_value=1,
+                step=1,
+                key="delete_one_id"
+            )
+            confirm_one=st.checkbox(
+                f"Tôi xác nhận xóa bản ghi ID {int(rid)}",
+                key="confirm_delete_one"
+            )
+            if st.button(
+                "XÓA BẢN GHI",
+                type="primary",
+                disabled=not confirm_one,
+                key="delete_one_button"
+            ):
+                ok,msg=delete_record(int(rid))
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        elif delete_mode=="Xóa toàn bộ dữ liệu nháp đang lọc":
+            if "status" not in view.columns:
+                draft_view=view.iloc[0:0]
+            else:
+                draft_view=view[
+                    view["status"].astype(str).str.strip().str.lower()=="nháp"
+                ]
+
+            st.info(
+                f"Có {len(draft_view)} bản ghi Nháp phù hợp với bộ lọc hiện tại."
+            )
+
+            confirm_text=st.text_input(
+                'Nhập chính xác chữ "XOA NHAP" để xác nhận',
+                key="confirm_delete_drafts_text"
+            )
+            can_delete=(
+                len(draft_view)>0 and
+                confirm_text.strip().upper()=="XOA NHAP"
+            )
+
+            if st.button(
+                f"XÓA {len(draft_view)} BẢN GHI NHÁP",
+                type="primary",
+                disabled=not can_delete,
+                key="delete_drafts_button"
+            ):
+                deleted=0
+                errors=[]
+                for rid in draft_view["id"].dropna().tolist():
+                    ok,msg=delete_record(int(rid))
+                    if ok:
+                        deleted+=1
+                    else:
+                        errors.append(f"ID {rid}: {msg}")
+
+                if errors:
+                    st.warning(
+                        f"Đã xóa {deleted} bản ghi; "
+                        f"có {len(errors)} lỗi. Lỗi đầu tiên: {errors[0]}"
+                    )
+                else:
+                    st.success(f"Đã xóa {deleted} bản ghi Nháp.")
+                st.rerun()
+
+        else:
+            st.error(
+                "Tùy chọn này sẽ xóa tất cả bản ghi đang hiển thị theo "
+                "bộ lọc Trại, Năm, Tuần và Trạng thái."
+            )
+            st.write(
+                f"Số bản ghi sẽ bị xóa: **{len(view)}**"
+            )
+
+            confirm_text=st.text_input(
+                'Nhập chính xác chữ "XOA TAT CA" để xác nhận',
+                key="confirm_delete_all_text"
+            )
+            can_delete=(
+                len(view)>0 and
+                confirm_text.strip().upper()=="XOA TAT CA"
+            )
+
+            if st.button(
+                f"XÓA {len(view)} BẢN GHI ĐANG LỌC",
+                type="primary",
+                disabled=not can_delete,
+                key="delete_all_filtered_button"
+            ):
+                deleted=0
+                errors=[]
+                for rid in view["id"].dropna().tolist():
+                    ok,msg=delete_record(int(rid))
+                    if ok:
+                        deleted+=1
+                    else:
+                        errors.append(f"ID {rid}: {msg}")
+
+                if errors:
+                    st.warning(
+                        f"Đã xóa {deleted} bản ghi; "
+                        f"có {len(errors)} lỗi. Lỗi đầu tiên: {errors[0]}"
+                    )
+                else:
+                    st.success(f"Đã xóa {deleted} bản ghi.")
+                st.rerun()
+
+    else:
+        st.caption(
+            "Chức năng xóa dữ liệu chỉ hiển thị cho tài khoản Admin."
+        )
 
 def dashboard_page():
     st.header("Dashboard GT35")
 
     df = load_records()
-
-    # Luôn hiển thị Dashboard tổng hợp và 14 hạng mục, kể cả khi chưa có dữ liệu.
-    # Khi chưa có bản ghi, mỗi phần sẽ báo "Chưa có dữ liệu" thay vì dừng toàn trang.
     if df.empty:
-        st.info(
-            "Chưa có bản ghi đã lưu trong hệ thống. "
-            "Hãy vào 'Nhập từ Excel', đánh dấu xác nhận và bấm "
-            "'NHẬP TOÀN BỘ DỮ LIỆU', hoặc lưu phiếu tại 'Nhập liệu Input Data'."
-        )
-        df = pd.DataFrame()
+        st.info("Chưa có dữ liệu.")
+        return
 
     c1, c2 = st.columns(2)
-    farm_options = ["Tất cả"]
-    year_options = ["Tất cả"]
-    if not df.empty:
-        if "farm" in df.columns:
-            farm_options += sorted(df["farm"].dropna().astype(str).unique().tolist())
-        if "year" in df.columns:
-            year_options += sorted(
-                df["year"].dropna().astype(str).unique().tolist(), reverse=True
-            )
-
-    farm = c1.selectbox("Lọc trại", farm_options, key="dfarm")
-    year = c2.selectbox("Lọc năm", year_options, key="dyear")
+    farm = c1.selectbox(
+        "Lọc trại",
+        ["Tất cả"] + sorted(
+            df["farm"].dropna().astype(str).unique().tolist()
+        ),
+        key="dfarm"
+    )
+    year = c2.selectbox(
+        "Lọc năm",
+        ["Tất cả"] + sorted(
+            df["year"].dropna().astype(str).unique().tolist(),
+            reverse=True
+        ),
+        key="dyear"
+    )
 
     view = df.copy()
-    if not view.empty:
-        if farm != "Tất cả" and "farm" in view.columns:
-            view = view[view["farm"].astype(str) == farm]
-        if year != "Tất cả" and "year" in view.columns:
-            view = view[view["year"].astype(str) == year]
+    if farm != "Tất cả":
+        view = view[view["farm"].astype(str) == farm]
+    if year != "Tất cả":
+        view = view[view["year"].astype(str) == year]
+
+    if view.empty:
+        st.warning("Không có dữ liệu phù hợp với bộ lọc.")
+        return
 
     module_groups = [
         g for g in GROUP_ORDER
         if "THÔNG TIN CHUNG" not in g.upper()
-    ][:14]
+    ]
 
     tabs = st.tabs(["TỔNG HỢP"] + module_groups)
 
     with tabs[0]:
-        if view.empty:
-            st.warning(
-                "Dashboard đang hiển thị cấu trúc báo cáo. "
-                "Chưa có dữ liệu đã lưu để tính kết quả tổng hợp."
-            )
-
         output = sum_if_available(view, "Số heo xuất")
         total_cost = sum_if_available(view, "Tổng chi phí")
         feed = sum_if_available(view, "Lượng cám sử dụng (kg)")
