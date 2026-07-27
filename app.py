@@ -1,6 +1,7 @@
 import io
 from datetime import datetime, date
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
@@ -883,6 +884,260 @@ def dashboard_page():
                 height=380
             )
 
+
+def _ai_prepare_cost_data(df):
+    """Chuẩn hóa dữ liệu phục vụ dự báo, không làm thay đổi dữ liệu gốc."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    cost_key = KEY_BY_VI.get("Giá thành/kg")
+    baseline_key = KEY_BY_VI.get("Giá thành cơ sở/kg")
+
+    if not cost_key or cost_key not in out.columns:
+        return pd.DataFrame()
+
+    out["_cost_per_kg"] = pd.to_numeric(out[cost_key], errors="coerce")
+    if baseline_key and baseline_key in out.columns:
+        out["_baseline_per_kg"] = pd.to_numeric(out[baseline_key], errors="coerce")
+    else:
+        out["_baseline_per_kg"] = np.nan
+
+    if "year" in out.columns:
+        out["_year"] = pd.to_numeric(out["year"], errors="coerce")
+    else:
+        year_key = KEY_BY_VI.get("Năm")
+        out["_year"] = pd.to_numeric(out.get(year_key), errors="coerce")
+
+    if "week" in out.columns:
+        out["_week"] = pd.to_numeric(out["week"], errors="coerce")
+    else:
+        week_key = KEY_BY_VI.get("Tuần")
+        out["_week"] = pd.to_numeric(out.get(week_key), errors="coerce")
+
+    if "farm" not in out.columns:
+        farm_key = KEY_BY_VI.get("Trại")
+        out["farm"] = out.get(farm_key, "")
+
+    out = out.dropna(subset=["_cost_per_kg", "_year", "_week"])
+    out = out[out["_cost_per_kg"] >= 0]
+    return out
+
+
+def _ai_weekly_cost(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["year", "week", "cost_per_kg"])
+
+    weekly = (
+        df.groupby(["_year", "_week"], as_index=False)
+        .agg(cost_per_kg=("_cost_per_kg", "mean"))
+        .rename(columns={"_year": "year", "_week": "week"})
+        .sort_values(["year", "week"])
+    )
+    weekly["period"] = (
+        weekly["year"].astype(int).astype(str)
+        + "-W"
+        + weekly["week"].astype(int).astype(str).str.zfill(2)
+    )
+    return weekly.reset_index(drop=True)
+
+
+def _ai_linear_forecast(weekly_df, periods=4, lookback=8):
+    """Dự báo xu hướng tuyến tính đơn giản và có thể giải thích."""
+    if weekly_df is None or weekly_df.empty:
+        return None, None
+
+    values = pd.to_numeric(weekly_df["cost_per_kg"], errors="coerce").dropna()
+    if len(values) < 2:
+        return None, None
+
+    recent = values.tail(min(lookback, len(values))).to_numpy(dtype=float)
+    x = np.arange(len(recent), dtype=float)
+    slope, intercept = np.polyfit(x, recent, 1)
+    future_x = len(recent) + int(periods) - 1
+    forecast = max(float(intercept + slope * future_x), 0.0)
+    return forecast, float(slope)
+
+
+def _ai_baseline(df):
+    if df is None or df.empty:
+        return None
+    s = pd.to_numeric(df.get("_baseline_per_kg"), errors="coerce").dropna()
+    return None if s.empty else float(s.mean())
+
+
+def _ai_status_text(saving, target=35000.0):
+    if saving is None:
+        return "Chưa đủ dữ liệu"
+    return "ĐẠT" if saving >= target else "CHƯA ĐẠT"
+
+
+def _ai_forecast_panel(data, title, forecast_weeks, target_saving=35000.0, system_average=None):
+    st.markdown(f"### {title}")
+    weekly = _ai_weekly_cost(data)
+    if len(weekly) < 2:
+        st.warning("Cần tối thiểu 2 tuần có dữ liệu giá thành/kg để dự báo.")
+        return
+
+    current_cost = float(weekly["cost_per_kg"].tail(min(4, len(weekly))).mean())
+    forecast_cost, slope = _ai_linear_forecast(weekly, periods=forecast_weeks)
+    baseline = _ai_baseline(data)
+
+    if forecast_cost is None:
+        st.warning("Chưa đủ dữ liệu hợp lệ để dự báo.")
+        return
+
+    saving = baseline - forecast_cost if baseline is not None else None
+    gap = target_saving - saving if saving is not None else None
+
+    cols = st.columns(5)
+    cols[0].metric("Giá thành hiện tại", f"{format_number(current_cost, 0)} đ/kg")
+    cols[1].metric(
+        f"Dự báo sau {forecast_weeks} tuần",
+        f"{format_number(forecast_cost, 0)} đ/kg",
+        delta=f"{format_number(forecast_cost-current_cost, 0)} đ/kg"
+    )
+    cols[2].metric("Baseline", "—" if baseline is None else f"{format_number(baseline, 0)} đ/kg")
+    cols[3].metric("Mức giảm dự báo", "—" if saving is None else f"{format_number(saving, 0)} đ/kg")
+    cols[4].metric("Trạng thái GT35", _ai_status_text(saving, target_saving))
+
+    if saving is None:
+        st.info("Chưa có Giá thành cơ sở/kg nên chưa thể xác định mức giảm so với baseline.")
+    elif saving >= target_saving:
+        st.success(
+            f"Dự báo đạt mục tiêu: giảm {format_number(saving, 0)} đ/kg, "
+            f"cao hơn yêu cầu {format_number(saving-target_saving, 0)} đ/kg."
+        )
+    else:
+        st.warning(
+            f"Dự báo chưa đạt mục tiêu giảm ≥ {format_number(target_saving, 0)} đ/kg. "
+            f"Cần giảm thêm {format_number(max(gap, 0), 0)} đ/kg."
+        )
+
+    if slope > 0:
+        st.error(f"Xu hướng giá thành đang tăng khoảng {format_number(slope, 0)} đ/kg mỗi tuần.")
+    elif slope < 0:
+        st.success(f"Xu hướng giá thành đang giảm khoảng {format_number(abs(slope), 0)} đ/kg mỗi tuần.")
+    else:
+        st.info("Xu hướng giá thành gần như không thay đổi.")
+
+    if system_average is not None:
+        diff = forecast_cost - system_average
+        if diff > 0:
+            st.warning(f"Dự báo cao hơn bình quân toàn hệ thống {format_number(diff, 0)} đ/kg.")
+        else:
+            st.success(f"Dự báo thấp hơn bình quân toàn hệ thống {format_number(abs(diff), 0)} đ/kg.")
+
+    chart = weekly[["period", "cost_per_kg"]].copy()
+    chart = chart.rename(columns={"period": "Tuần", "cost_per_kg": "Giá thành thực tế (đ/kg)"})
+    st.line_chart(chart.set_index("Tuần"), use_container_width=True)
+
+
+def ai_platform_page(user):
+    """Trang AI Platform chỉ dành cho Admin."""
+    if user.get("role") != "admin":
+        st.error("Chức năng AI Platform chỉ dành cho Admin.")
+        return
+
+    st.header("🤖 AI Platform – Dự báo chi phí GT35")
+    st.caption(
+        "Dự báo xu hướng giá thành/kg từ dữ liệu đã lưu. "
+        "Mục tiêu GT35: mức giảm so với baseline ≥ 35.000 VND/kg."
+    )
+
+    raw = load_records()
+    data = _ai_prepare_cost_data(raw)
+    if data.empty:
+        st.warning("Chưa có dữ liệu Giá thành/kg hợp lệ để phân tích.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    years = sorted(data["_year"].dropna().astype(int).unique().tolist(), reverse=True)
+    selected_year = c1.selectbox("Năm phân tích", ["Tất cả"] + years, key="ai_year")
+    forecast_weeks = c2.selectbox("Số tuần dự báo", [1, 2, 4, 8], index=2, key="ai_weeks")
+    target_saving = c3.number_input(
+        "Mục tiêu giảm (VND/kg)", min_value=0.0, value=35000.0, step=1000.0, key="ai_target"
+    )
+
+    if selected_year != "Tất cả":
+        data = data[data["_year"] == int(selected_year)]
+
+    scope = st.radio(
+        "Phạm vi phân tích",
+        ["Tổng toàn bộ trại", "Từng trại"],
+        horizontal=True,
+        key="ai_scope"
+    )
+
+    total_weekly = _ai_weekly_cost(data)
+    total_forecast, _ = _ai_linear_forecast(total_weekly, periods=forecast_weeks)
+
+    if scope == "Tổng toàn bộ trại":
+        _ai_forecast_panel(
+            data,
+            "Dự báo tổng toàn bộ trại",
+            forecast_weeks,
+            target_saving=target_saving
+        )
+
+        st.subheader("So sánh và xếp hạng từng trại")
+        rows = []
+        for farm_name in sorted(data["farm"].dropna().astype(str).unique().tolist()):
+            farm_data = data[data["farm"].astype(str) == farm_name]
+            weekly = _ai_weekly_cost(farm_data)
+            forecast, slope = _ai_linear_forecast(weekly, periods=forecast_weeks)
+            if weekly.empty:
+                continue
+            current = float(weekly["cost_per_kg"].tail(min(4, len(weekly))).mean())
+            baseline = _ai_baseline(farm_data)
+            saving = baseline - forecast if baseline is not None and forecast is not None else None
+            rows.append({
+                "Trại": farm_name,
+                "Giá thành hiện tại (đ/kg)": current,
+                "Giá thành dự báo (đ/kg)": forecast,
+                "Baseline (đ/kg)": baseline,
+                "Mức giảm dự báo (đ/kg)": saving,
+                "Xu hướng/tuần (đ/kg)": slope,
+                "GT35": _ai_status_text(saving, target_saving)
+            })
+
+        ranking = pd.DataFrame(rows)
+        if ranking.empty:
+            st.info("Chưa đủ dữ liệu để lập bảng dự báo từng trại.")
+        else:
+            ranking = ranking.sort_values("Giá thành dự báo (đ/kg)", ascending=False, na_position="last")
+            st.dataframe(
+                ranking.style.format({
+                    "Giá thành hiện tại (đ/kg)": "{:,.0f}",
+                    "Giá thành dự báo (đ/kg)": "{:,.0f}",
+                    "Baseline (đ/kg)": "{:,.0f}",
+                    "Mức giảm dự báo (đ/kg)": "{:,.0f}",
+                    "Xu hướng/tuần (đ/kg)": "{:,.0f}"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+    else:
+        farms = sorted(data["farm"].dropna().astype(str).unique().tolist())
+        if not farms:
+            st.warning("Không có tên trại hợp lệ trong dữ liệu.")
+            return
+        selected_farm = st.selectbox("Chọn trại", farms, key="ai_farm")
+        farm_data = data[data["farm"].astype(str) == selected_farm]
+        _ai_forecast_panel(
+            farm_data,
+            f"Dự báo trại {selected_farm}",
+            forecast_weeks,
+            target_saving=target_saving,
+            system_average=total_forecast
+        )
+
+    st.divider()
+    st.caption(
+        "Lưu ý: Đây là dự báo xu hướng tuyến tính từ dữ liệu lịch sử, dùng để hỗ trợ quyết định. "
+        "Kết quả không tự động sửa dữ liệu hoặc thay thế quyết định của Admin."
+    )
+
 def main():
     inject_css()
     seed_farms(INITIAL_FARMS)
@@ -893,10 +1148,13 @@ def main():
         st.markdown("## 🐷 GT35 WEB V4")
         st.write(f"**{user.get('email')}**")
         st.caption(f"Vai trò: {user.get('role','user')}")
-        page=st.radio("Chức năng",[
+        menu_items=[
             "Dashboard","Nhập liệu Input Data","Nhập từ Excel",
             "Dữ liệu & Báo cáo","Quản lý trại"
-        ])
+        ]
+        if user.get("role")=="admin":
+            menu_items.append("AI Platform")
+        page=st.radio("Chức năng",menu_items)
         st.divider()
         st.caption("Dữ liệu: "+("Supabase trực tuyến" if is_supabase_configured() else "SQLite chạy thử"))
         if st.button("Đăng xuất",use_container_width=True):
@@ -908,6 +1166,7 @@ def main():
     elif page=="Nhập liệu Input Data": input_page(user)
     elif page=="Nhập từ Excel": import_excel_page(user)
     elif page=="Dữ liệu & Báo cáo": records_page(user)
+    elif page=="AI Platform": ai_platform_page(user)
     else: farm_management_page(user)
 
 if __name__=="__main__":
