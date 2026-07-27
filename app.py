@@ -143,7 +143,7 @@ def recalculate(record):
     baseline = val(record,"Giá thành cơ sở/kg")
     target_saving = val(record,"Mục tiêu tiết kiệm (đồng/kg)")
 
-    setv(record,"Chi phí thức ăn/con",safe_div(feed_cost,output_pigs))
+    setv(record,"Chi phí thức ăn/kg",safe_div(feed_cost,output_pigs))
     setv(record,"FCR",safe_div(feed,gain))
     fcr = val(record,"FCR")
     fcr_target = val(record,"FCR mục tiêu")
@@ -584,15 +584,15 @@ def dashboard_page():
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Heo xuất", format_number(output, 0))
-        m2.metric("Giá thành/con", "—" if cost_per_pig is None else f"{format_number(cost_per_pig, 0)} đ")
+        m2.metric("Giá thành/kg", "—" if cost_per_pig is None else f"{format_number(cost_per_pig, 0)} đ")
         m3.metric("FCR", "—" if fcr is None else format_number(fcr, 3))
         m4.metric("ADG", "—" if adg is None else f"{format_number(adg, 0)} g/ngày")
         m5.metric("Tỷ lệ chết", "—" if death_rate is None else f"{format_number(death_rate, 2)}%")
 
         st.subheader("Kết quả chung")
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Giá thành cơ sở/con", "—" if baseline is None else f"{format_number(baseline, 0)} đ")
-        r2.metric("Giá thành hiện tại/con", "—" if cost_per_pig is None else f"{format_number(cost_per_pig, 0)} đ")
+        r1.metric("Giá thành cơ sở/kg", "—" if baseline is None else f"{format_number(baseline, 0)} đ")
+        r2.metric("Giá thành hiện tại/kg", "—" if cost_per_pig is None else f"{format_number(cost_per_pig, 0)} đ")
 
         if saving is None:
             r3.metric("Kết quả", "Chưa đủ dữ liệu")
