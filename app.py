@@ -1108,6 +1108,698 @@ def _ai_farm_summary(data, forecast_weeks, target_saving):
     }
 
 
+
+def _ai_mean_metric(df, vi_name):
+    """Lấy trung bình một chỉ tiêu theo tên tiếng Việt; thiếu dữ liệu trả về None."""
+    key = KEY_BY_VI.get(vi_name)
+    if df is None or df.empty or not key or key not in df.columns:
+        return None
+    s = pd.to_numeric(df[key], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return None if s.empty else float(s.mean())
+
+
+def _ai_pct_display(value):
+    """Hiển thị tỷ lệ nhất quán dù dữ liệu đang lưu dạng 0–1 hay 0–100."""
+    if value is None or pd.isna(value):
+        return "—"
+    shown = value * 100 if abs(value) <= 1.5 else value
+    return f"{format_number(shown, 2)}%"
+
+
+def _ai_relative_score(actual, reference, bad_when="high"):
+    """
+    Chấm điểm mức lệch so với tham chiếu.
+    0: không xấu hơn; 1: nhẹ; 2: trung bình; 3: cao; 4: rất cao.
+    """
+    if actual is None or reference is None:
+        return 0
+    try:
+        actual = float(actual)
+        reference = float(reference)
+        if reference == 0:
+            return 0
+        deviation = (
+            (actual - reference) / abs(reference)
+            if bad_when == "high"
+            else (reference - actual) / abs(reference)
+        )
+        if deviation <= 0:
+            return 0
+        if deviation < 0.05:
+            return 1
+        if deviation < 0.10:
+            return 2
+        if deviation < 0.20:
+            return 3
+        return 4
+    except Exception:
+        return 0
+
+
+def _ai_priority_label(score):
+    if score >= 4:
+        return "RẤT CAO"
+    if score >= 3:
+        return "CAO"
+    if score >= 2:
+        return "TRUNG BÌNH"
+    return "THẤP"
+
+
+def _ai_build_cost_causes(farm_data, system_data):
+    """
+    Tạo danh sách nguyên nhân dựa trên dữ liệu thật.
+    Ưu tiên so với mục tiêu; nếu không có mục tiêu thì so với toàn hệ thống.
+    Không tự tạo số liệu cho chỉ tiêu bị thiếu.
+    """
+    causes = []
+    missing = []
+
+    def add_cause(name, actual_vi, target_vi, bad_when, unit, action, system_compare=True):
+        actual = _ai_mean_metric(farm_data, actual_vi)
+        target = _ai_mean_metric(farm_data, target_vi) if target_vi else None
+        reference_name = "mục tiêu"
+        reference = target
+
+        if reference is None and system_compare:
+            reference = _ai_mean_metric(system_data, actual_vi)
+            reference_name = "bình quân hệ thống"
+
+        if actual is None:
+            missing.append(actual_vi)
+            return
+
+        if reference is None:
+            missing.append(f"{target_vi or actual_vi} (tham chiếu)")
+            return
+
+        score = _ai_relative_score(actual, reference, bad_when)
+        if score <= 0:
+            return
+
+        if unit == "%":
+            actual_text = _ai_pct_display(actual)
+            reference_text = _ai_pct_display(reference)
+        elif unit:
+            actual_text = f"{format_number(actual, 3)} {unit}"
+            reference_text = f"{format_number(reference, 3)} {unit}"
+        else:
+            actual_text = format_number(actual, 3)
+            reference_text = format_number(reference, 3)
+
+        direction = "cao hơn" if bad_when == "high" else "thấp hơn"
+        causes.append({
+            "score": score,
+            "Nguyên nhân": name,
+            "Mức ưu tiên": _ai_priority_label(score),
+            "Bằng chứng": (
+                f"{actual_vi}: {actual_text}, {direction} "
+                f"{reference_name}: {reference_text}."
+            ),
+            "Hành động đề xuất": action,
+        })
+
+    add_cause(
+        "FCR cao",
+        "FCR",
+        "FCR mục tiêu",
+        "high",
+        "",
+        "Kiểm tra hao hụt cám, độ chính xác cấp cám, máng ăn, chất lượng thức ăn và phân nhóm heo theo khối lượng.",
+    )
+    add_cause(
+        "ADG thấp",
+        "ADG (g/ngày)",
+        "ADG mục tiêu (g/ngày)",
+        "low",
+        "g/ngày",
+        "Kiểm tra lượng ăn, sức khỏe đàn, mật độ nuôi, nhiệt độ chuồng và chương trình dinh dưỡng.",
+    )
+    add_cause(
+        "Ngày nuôi kéo dài",
+        "Số ngày nuôi/con xuất",
+        "Số ngày nuôi mục tiêu/con xuất",
+        "high",
+        "ngày",
+        "Rà soát tăng trọng theo giai đoạn, tuổi/khối lượng nhập, bệnh mãn tính và thời điểm xuất bán.",
+    )
+    add_cause(
+        "Tỷ lệ chọn giống thấp",
+        "Tỷ lệ chọn giống (%)",
+        "Tỷ lệ chọn giống mục tiêu (%)",
+        "low",
+        "%",
+        "Phân tích nguyên nhân không đạt, chất lượng đầu vào, chân móng, ngoại hình, tăng trưởng và tiêu chuẩn chọn giống.",
+    )
+    add_cause(
+        "Tỷ lệ chết cao",
+        "Tỷ lệ chết (%)",
+        None,
+        "high",
+        "%",
+        "Phân tích nguyên nhân chết theo tuần; kiểm tra PRRS, APP, Mycoplasma, điều trị sớm và an toàn sinh học.",
+    )
+    add_cause(
+        "Tỷ lệ loại thải sớm cao",
+        "Tỷ lệ loại thải sớm (%)",
+        None,
+        "high",
+        "%",
+        "Phân loại nguyên nhân loại thải sớm, kiểm tra chất lượng heo nhập và biện pháp can thiệp ở giai đoạn đầu.",
+    )
+    add_cause(
+        "Tổng hao hụt cao",
+        "Tổng tỷ lệ hao hụt (%)",
+        None,
+        "high",
+        "%",
+        "Lập Pareto chết và loại thải; tập trung xử lý 2–3 nguyên nhân chiếm tỷ trọng lớn nhất.",
+    )
+    add_cause(
+        "Tỷ lệ mắc bệnh cao",
+        "Tỷ lệ mắc bệnh (%)",
+        None,
+        "high",
+        "%",
+        "Kiểm tra mô hình bệnh theo tuần, hiệu quả điều trị, vaccine, thông khí và điều kiện chuồng nuôi.",
+    )
+    add_cause(
+        "Chi phí thức ăn/kg cao",
+        "Chi phí thức ăn/kg",
+        None,
+        "high",
+        "đ/kg",
+        "Rà soát giá cám, FCR, hao hụt tồn kho, định mức cấp cám và hiệu quả từng công thức thức ăn.",
+    )
+    add_cause(
+        "Chi phí thuốc/kg cao",
+        "Chi phí thuốc/kg",
+        None,
+        "high",
+        "đ/kg",
+        "Rà soát nhóm thuốc chi phí cao, phác đồ điều trị, tỷ lệ tái điều trị và nguyên nhân bệnh chính.",
+    )
+    add_cause(
+        "Chi phí vaccine/kg cao",
+        "Chi phí vaccine/kg",
+        None,
+        "high",
+        "đ/kg",
+        "Kiểm tra chương trình vaccine, hao hụt sử dụng, liều lượng và mức phù hợp với nguy cơ dịch tễ.",
+    )
+    add_cause(
+        "Chi phí điện nước vật tư/kg cao",
+        "Chi phí điện nước vật tư/kg",
+        None,
+        "high",
+        "đ/kg",
+        "Kiểm tra điện quạt, bơm nước, rò rỉ, định mức vật tư và các thiết bị tiêu thụ bất thường.",
+    )
+
+    causes = sorted(causes, key=lambda x: x["score"], reverse=True)[:5]
+    return causes, sorted(set(missing))
+
+
+def _ai_overall_priority(farm_summary, causes):
+    """Xếp hạng mức độ ưu tiên chung của trại."""
+    scores = [c["score"] for c in causes]
+    max_score = max(scores) if scores else 0
+    high_count = sum(s >= 3 for s in scores)
+
+    slope = farm_summary.get("Xu hướng/tuần (đ/kg)")
+    gt35 = farm_summary.get("GT35")
+
+    if slope is not None and slope > 0:
+        max_score = max(max_score, 3)
+    if gt35 == "CHƯA ĐẠT":
+        max_score = max(max_score, 2)
+    if high_count >= 3 or max_score >= 4:
+        return "RẤT CAO"
+    if high_count >= 1 or max_score >= 3:
+        return "CAO"
+    if max_score >= 2:
+        return "TRUNG BÌNH"
+    return "THẤP"
+
+
+def _ai_write_farm_comment(selected_farm, farm_summary, causes, missing):
+    """Tạo nhận xét tự động, chỉ dựa trên dữ liệu hiện có."""
+    priority = _ai_overall_priority(farm_summary, causes)
+    current = farm_summary.get("Giá thành hiện tại (đ/kg)")
+    forecast = farm_summary.get("Giá thành dự báo (đ/kg)")
+    slope = farm_summary.get("Xu hướng/tuần (đ/kg)")
+    gt35 = farm_summary.get("GT35")
+
+    sentences = [
+        f"Trại **{selected_farm}** có mức độ ưu tiên **{priority}**."
+    ]
+
+    if current is not None:
+        sentences.append(
+            f"Giá thành hiện tại khoảng **{format_number(current, 0)} đ/kg**."
+        )
+    if forecast is not None:
+        sentences.append(
+            f"Giá thành dự báo khoảng **{format_number(forecast, 0)} đ/kg**."
+        )
+    if slope is not None:
+        if slope > 0:
+            sentences.append(
+                f"Xu hướng đang tăng khoảng **{format_number(slope, 0)} đ/kg/tuần**."
+            )
+        elif slope < 0:
+            sentences.append(
+                f"Xu hướng đang giảm khoảng **{format_number(abs(slope), 0)} đ/kg/tuần**."
+            )
+        else:
+            sentences.append("Xu hướng giá thành gần như ổn định.")
+
+    if gt35 == "ĐẠT":
+        sentences.append("Dự báo hiện đạt mục tiêu GT35.")
+    elif gt35 == "CHƯA ĐẠT":
+        sentences.append("Dự báo hiện chưa đạt mục tiêu GT35.")
+
+    if causes:
+        top_names = ", ".join(c["Nguyên nhân"] for c in causes[:3])
+        sentences.append(f"Các vấn đề cần ưu tiên trước gồm: **{top_names}**.")
+    else:
+        sentences.append(
+            "Chưa phát hiện chỉ tiêu xấu hơn mục tiêu hoặc bình quân hệ thống từ dữ liệu hiện có."
+        )
+
+    if missing:
+        sentences.append(
+            "Một số chỉ tiêu còn thiếu nên nhận xét chỉ dựa trên phần dữ liệu đã có."
+        )
+
+    return " ".join(sentences), priority
+
+
+def _ai_show_farm_diagnostics(
+    farm_data,
+    system_data,
+    selected_farm,
+    farm_summary,
+):
+    """Hiển thị 4 chức năng AI mới cho từng trại."""
+    causes, missing = _ai_build_cost_causes(farm_data, system_data)
+    comment, priority = _ai_write_farm_comment(
+        selected_farm,
+        farm_summary,
+        causes,
+        missing,
+    )
+
+    st.divider()
+    st.markdown("## 🧠 AI phân tích nguyên nhân và hành động")
+
+    c1, c2 = st.columns([1, 3])
+    c1.metric("Mức độ ưu tiên", priority)
+    with c2:
+        st.markdown("### 1. Nhận xét tự động")
+        st.info(comment)
+
+    st.markdown("### 2. Xếp hạng mức độ ưu tiên")
+    priority_order = {
+        "RẤT CAO": 1,
+        "CAO": 2,
+        "TRUNG BÌNH": 3,
+        "THẤP": 4,
+    }
+
+    if causes:
+        cause_df = pd.DataFrame([
+            {
+                "Thứ tự": idx + 1,
+                "Nguyên nhân": cause["Nguyên nhân"],
+                "Mức ưu tiên": cause["Mức ưu tiên"],
+                "Bằng chứng": cause["Bằng chứng"],
+            }
+            for idx, cause in enumerate(causes)
+        ])
+        cause_df["_order"] = cause_df["Mức ưu tiên"].map(priority_order).fillna(9)
+        cause_df = cause_df.sort_values(
+            ["_order", "Thứ tự"]
+        ).drop(columns="_order")
+        st.dataframe(cause_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### 3. Top 5 nguyên nhân làm tăng giá thành")
+        for idx, cause in enumerate(causes, start=1):
+            st.markdown(
+                f"**{idx}. {cause['Nguyên nhân']} — {cause['Mức ưu tiên']}**  \n"
+                f"{cause['Bằng chứng']}"
+            )
+
+        st.markdown("### 4. Hành động đề xuất cho từng nguyên nhân")
+        action_df = pd.DataFrame([
+            {
+                "Ưu tiên": idx + 1,
+                "Nguyên nhân": cause["Nguyên nhân"],
+                "Hành động đề xuất": cause["Hành động đề xuất"],
+            }
+            for idx, cause in enumerate(causes)
+        ])
+        st.dataframe(action_df, use_container_width=True, hide_index=True)
+    else:
+        st.success(
+            "Chưa phát hiện nguyên nhân bất lợi rõ ràng so với mục tiêu "
+            "hoặc bình quân toàn hệ thống từ dữ liệu hiện có."
+        )
+
+    if missing:
+        with st.expander("Các chỉ tiêu thiếu dữ liệu, không dùng để kết luận"):
+            st.write(", ".join(missing))
+
+
+def _ai_clamp(value, low, high):
+    try:
+        return max(low, min(high, float(value)))
+    except Exception:
+        return low
+
+
+def _ai_decision_plan(farm_data, system_data, selected_farm, farm_summary):
+    """Giai đoạn 2: chuyển nguyên nhân thành quyết định ưu tiên có thể hành động."""
+    causes, missing = _ai_build_cost_causes(farm_data, system_data)
+    st.divider()
+    st.markdown("## 🎯 AI Decision – Quyết định ưu tiên")
+
+    if not causes:
+        st.success(
+            "Chưa phát hiện vấn đề bất lợi rõ ràng từ dữ liệu hiện có. "
+            "Tiếp tục theo dõi xu hướng và bổ sung các chỉ tiêu còn thiếu."
+        )
+        return causes
+
+    decision_rows = []
+    for idx, cause in enumerate(causes, start=1):
+        level = cause["Mức ưu tiên"]
+        if level == "RẤT CAO":
+            timing = "Thực hiện ngay trong tuần"
+            owner = "Quản lý trại + Bộ phận chuyên môn"
+        elif level == "CAO":
+            timing = "Triển khai trong 1–2 tuần"
+            owner = "Quản lý trại"
+        elif level == "TRUNG BÌNH":
+            timing = "Lập kế hoạch trong tháng"
+            owner = "Phụ trách hạng mục"
+        else:
+            timing = "Theo dõi định kỳ"
+            owner = "Nhân viên phụ trách"
+
+        decision_rows.append({
+            "Thứ tự": idx,
+            "Mức ưu tiên": level,
+            "Vấn đề cần quyết định": cause["Nguyên nhân"],
+            "Quyết định đề xuất": cause["Hành động đề xuất"],
+            "Thời hạn": timing,
+            "Đầu mối": owner,
+            "Bằng chứng": cause["Bằng chứng"],
+        })
+
+    st.dataframe(
+        pd.DataFrame(decision_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    top = causes[0]
+    st.warning(
+        f"**Quyết định ưu tiên số 1 cho trại {selected_farm}:** "
+        f"{top['Nguyên nhân']}. {top['Hành động đề xuất']}"
+    )
+    if missing:
+        st.caption(
+            "Quyết định chỉ dựa trên dữ liệu hiện có. Chỉ tiêu thiếu: "
+            + ", ".join(missing)
+        )
+    return causes
+
+
+def _ai_simulation_panel(farm_data, selected_farm, farm_summary):
+    """Giai đoạn 3: mô phỏng tác động khi cải thiện KPI.
+
+    Đây là mô hình độ nhạy minh bạch, không phải mô hình nhân quả đã hiệu chỉnh.
+    """
+    st.divider()
+    st.markdown("## 🧪 AI Simulation – Mô phỏng phương án")
+
+    current_cost = farm_summary.get("Giá thành hiện tại (đ/kg)")
+    if current_cost is None or pd.isna(current_cost) or current_cost <= 0:
+        st.info("Thiếu giá thành hiện tại nên chưa thể chạy mô phỏng.")
+        return None
+
+    fcr = _ai_mean_metric(farm_data, "FCR")
+    adg = _ai_mean_metric(farm_data, "ADG (g/ngày)")
+    death = _ai_mean_metric(farm_data, "Tỷ lệ chết (%)")
+    days = _ai_mean_metric(farm_data, "Số ngày nuôi/con xuất")
+    feed_cost_kg = _ai_mean_metric(farm_data, "Chi phí thức ăn/kg")
+
+    # Chuẩn hóa tỷ lệ chết về phần trăm để hiển thị/mô phỏng.
+    death_pct = None
+    if death is not None:
+        death_pct = death * 100 if abs(death) <= 1.5 else death
+
+    feed_share = 0.65
+    if feed_cost_kg is not None and current_cost > 0:
+        feed_share = _ai_clamp(feed_cost_kg / current_cost, 0.30, 0.85)
+
+    st.caption(
+        "Mô phỏng dùng độ nhạy: FCR tác động theo tỷ trọng thức ăn; "
+        "ADG, ngày nuôi và tỷ lệ chết tác động theo hệ số quản trị thận trọng. "
+        "Kết quả là ước tính hỗ trợ quyết định, không thay thế thử nghiệm đối chứng."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if fcr is not None and fcr > 0:
+            sim_fcr = st.slider(
+                "FCR sau cải tiến",
+                min_value=max(0.5, round(float(fcr) * 0.75, 2)),
+                max_value=round(float(fcr), 2),
+                value=round(float(fcr), 2),
+                step=0.01,
+                key=f"sim_fcr_{selected_farm}",
+            )
+        else:
+            sim_fcr = None
+            st.text_input("FCR sau cải tiến", value="Thiếu dữ liệu", disabled=True)
+
+        if adg is not None and adg > 0:
+            sim_adg = st.slider(
+                "ADG sau cải tiến (g/ngày)",
+                min_value=int(round(float(adg))),
+                max_value=max(int(round(float(adg) * 1.35)), int(round(float(adg))) + 1),
+                value=int(round(float(adg))),
+                step=5,
+                key=f"sim_adg_{selected_farm}",
+            )
+        else:
+            sim_adg = None
+            st.text_input("ADG sau cải tiến", value="Thiếu dữ liệu", disabled=True)
+
+    with col2:
+        if days is not None and days > 0:
+            sim_days = st.slider(
+                "Số ngày nuôi sau cải tiến",
+                min_value=max(1, int(round(float(days) * 0.75))),
+                max_value=int(round(float(days))),
+                value=int(round(float(days))),
+                step=1,
+                key=f"sim_days_{selected_farm}",
+            )
+        else:
+            sim_days = None
+            st.text_input("Số ngày nuôi sau cải tiến", value="Thiếu dữ liệu", disabled=True)
+
+        if death_pct is not None and death_pct >= 0:
+            sim_death = st.slider(
+                "Tỷ lệ chết sau cải tiến (%)",
+                min_value=0.0,
+                max_value=max(round(float(death_pct), 2), 0.01),
+                value=round(float(death_pct), 2),
+                step=0.05,
+                key=f"sim_death_{selected_farm}",
+            )
+        else:
+            sim_death = None
+            st.text_input("Tỷ lệ chết sau cải tiến", value="Thiếu dữ liệu", disabled=True)
+
+    fcr_saving = 0.0
+    if fcr is not None and sim_fcr is not None and fcr > 0:
+        fcr_saving = current_cost * feed_share * max((float(fcr) - sim_fcr) / float(fcr), 0)
+
+    adg_saving = 0.0
+    if adg is not None and sim_adg is not None and adg > 0:
+        adg_saving = current_cost * 0.10 * max((sim_adg - float(adg)) / float(adg), 0)
+
+    days_saving = 0.0
+    if days is not None and sim_days is not None and days > 0:
+        days_saving = current_cost * (1 - feed_share) * 0.25 * max((float(days) - sim_days) / float(days), 0)
+
+    death_saving = 0.0
+    if death_pct is not None and sim_death is not None and death_pct > 0:
+        death_saving = current_cost * 0.08 * max((death_pct - sim_death) / death_pct, 0)
+
+    total_saving = min(
+        fcr_saving + adg_saving + days_saving + death_saving,
+        current_cost * 0.30,
+    )
+    simulated_cost = max(current_cost - total_saving, 0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Giá thành hiện tại", f"{format_number(current_cost, 0)} đ/kg")
+    m2.metric("Tiết kiệm mô phỏng", f"{format_number(total_saving, 0)} đ/kg")
+    m3.metric("Giá thành sau mô phỏng", f"{format_number(simulated_cost, 0)} đ/kg")
+    m4.metric("Tỷ trọng thức ăn dùng", f"{format_number(feed_share * 100, 1)}%")
+
+    impact = pd.DataFrame([
+        {"Phương án": "Giảm FCR", "Tiết kiệm ước tính (đ/kg)": fcr_saving},
+        {"Phương án": "Tăng ADG", "Tiết kiệm ước tính (đ/kg)": adg_saving},
+        {"Phương án": "Rút ngắn ngày nuôi", "Tiết kiệm ước tính (đ/kg)": days_saving},
+        {"Phương án": "Giảm tỷ lệ chết", "Tiết kiệm ước tính (đ/kg)": death_saving},
+    ])
+    impact["Tiết kiệm ước tính (đ/kg)"] = impact["Tiết kiệm ước tính (đ/kg)"].round(0)
+    impact = impact.sort_values("Tiết kiệm ước tính (đ/kg)", ascending=False)
+    st.dataframe(impact, use_container_width=True, hide_index=True)
+
+    return {
+        "current_cost": current_cost,
+        "simulated_cost": simulated_cost,
+        "total_saving": total_saving,
+        "impact": impact,
+    }
+
+
+def _ai_copilot_answer(question, selected_farm, farm_summary, causes, system_summary, simulation):
+    """Giai đoạn 4: trả lời câu hỏi bằng dữ liệu và quy tắc nội bộ, không gọi API ngoài."""
+    q = (question or "").strip().lower()
+    current = farm_summary.get("Giá thành hiện tại (đ/kg)")
+    forecast = farm_summary.get("Giá thành dự báo (đ/kg)")
+    saving = farm_summary.get("Mức giảm dự báo (đ/kg)")
+    slope = farm_summary.get("Xu hướng/tuần (đ/kg)")
+    gt35 = farm_summary.get("GT35")
+
+    if any(k in q for k in ["tại sao", "nguyên nhân", "vì sao", "tăng giá"]):
+        if not causes:
+            return "Chưa phát hiện nguyên nhân bất lợi rõ ràng từ dữ liệu hiện có."
+        lines = [f"Các nguyên nhân ưu tiên của trại **{selected_farm}**:"]
+        for i, c in enumerate(causes[:5], 1):
+            lines.append(f"{i}. **{c['Nguyên nhân']}** ({c['Mức ưu tiên']}): {c['Bằng chứng']}")
+        return "\n\n".join(lines)
+
+    if any(k in q for k in ["làm gì", "hành động", "ưu tiên", "quyết định", "khắc phục"]):
+        if not causes:
+            return "Chưa có vấn đề nổi bật để đề xuất hành động riêng. Hãy tiếp tục theo dõi và bổ sung dữ liệu."
+        lines = [f"Thứ tự hành động đề xuất cho **{selected_farm}**:"]
+        for i, c in enumerate(causes[:5], 1):
+            lines.append(f"{i}. **{c['Nguyên nhân']}**: {c['Hành động đề xuất']}")
+        return "\n\n".join(lines)
+
+    if any(k in q for k in ["đạt gt35", "mục tiêu", "35.000", "35000"]):
+        if saving is None:
+            return "Chưa có baseline hoặc dự báo phù hợp nên chưa đánh giá được mục tiêu GT35."
+        gap = 35000 - saving
+        if gt35 == "ĐẠT":
+            return f"Trại **{selected_farm}** đang được dự báo **ĐẠT GT35**, mức giảm khoảng **{format_number(saving, 0)} đ/kg**."
+        return f"Trại **{selected_farm}** hiện **CHƯA ĐẠT GT35**; cần giảm thêm khoảng **{format_number(max(gap, 0), 0)} đ/kg**."
+
+    if any(k in q for k in ["so sánh", "hệ thống", "trại khác"]):
+        system_current = system_summary.get("Giá thành hiện tại (đ/kg)")
+        if current is None or system_current is None:
+            return "Thiếu dữ liệu để so sánh trại với toàn hệ thống."
+        diff = current - system_current
+        direction = "cao hơn" if diff > 0 else "thấp hơn" if diff < 0 else "bằng"
+        return (
+            f"Giá thành hiện tại của **{selected_farm}** là **{format_number(current, 0)} đ/kg**, "
+            f"{direction} bình quân hệ thống **{format_number(abs(diff), 0)} đ/kg**."
+        )
+
+    if any(k in q for k in ["mô phỏng", "phương án", "tiết kiệm"]):
+        if not simulation:
+            return "Hãy điều chỉnh các thanh mô phỏng ở mục AI Simulation để có kết quả phương án."
+        return (
+            f"Theo phương án đang chọn, giá thành của **{selected_farm}** có thể từ "
+            f"**{format_number(simulation['current_cost'], 0)}** xuống khoảng "
+            f"**{format_number(simulation['simulated_cost'], 0)} đ/kg**, "
+            f"tương ứng tiết kiệm chỉ báo **{format_number(simulation['total_saving'], 0)} đ/kg**."
+        )
+
+    parts = [f"Tóm tắt trại **{selected_farm}**:"]
+    if current is not None:
+        parts.append(f"Giá thành hiện tại **{format_number(current, 0)} đ/kg**.")
+    if forecast is not None:
+        parts.append(f"Dự báo **{format_number(forecast, 0)} đ/kg**.")
+    if slope is not None:
+        trend = "tăng" if slope > 0 else "giảm" if slope < 0 else "ổn định"
+        parts.append(f"Xu hướng {trend} khoảng **{format_number(abs(slope), 0)} đ/kg/tuần**.")
+    if causes:
+        parts.append("Ưu tiên chính: " + ", ".join(c["Nguyên nhân"] for c in causes[:3]) + ".")
+    parts.append("Bạn có thể hỏi: 'Tại sao giá thành tăng?', 'Nên làm gì trước?', 'Có đạt GT35 không?' hoặc 'So sánh với hệ thống'.")
+    return " ".join(parts)
+
+
+def _ai_copilot_panel(farm_data, system_data, selected_farm, farm_summary, simulation):
+    st.divider()
+    st.markdown("## 💬 GT35 Copilot – Hỏi đáp dữ liệu trại")
+    st.caption(
+        "Copilot này trả lời bằng dữ liệu đang có và bộ quy tắc GT35 nội bộ; "
+        "không gửi dữ liệu ra dịch vụ AI bên ngoài."
+    )
+
+    causes, _ = _ai_build_cost_causes(farm_data, system_data)
+    system_summary = _ai_farm_summary(system_data, 4, 35000.0)
+    question = st.text_area(
+        "Nhập câu hỏi",
+        placeholder=(
+            "Ví dụ: Tại sao giá thành trại này tăng? Nên ưu tiên hành động nào? "
+            "Trại có đạt GT35 không?"
+        ),
+        key=f"copilot_question_{selected_farm}",
+    )
+    if st.button(
+        "🤖 HỎI GT35 COPILOT",
+        type="primary",
+        use_container_width=True,
+        key=f"copilot_run_{selected_farm}",
+    ):
+        answer = _ai_copilot_answer(
+            question,
+            selected_farm,
+            farm_summary,
+            causes,
+            system_summary,
+            simulation,
+        )
+        st.session_state[f"copilot_answer_{selected_farm}"] = answer
+
+    answer = st.session_state.get(f"copilot_answer_{selected_farm}")
+    if answer:
+        st.info(answer)
+
+
+def _ai_show_stages_2_3_4(farm_data, system_data, selected_farm, farm_summary):
+    """Hiển thị liền mạch Giai đoạn 2, 3 và 4 sau phần phân tích Giai đoạn 1."""
+    _ai_decision_plan(
+        farm_data=farm_data,
+        system_data=system_data,
+        selected_farm=selected_farm,
+        farm_summary=farm_summary,
+    )
+    simulation = _ai_simulation_panel(
+        farm_data=farm_data,
+        selected_farm=selected_farm,
+        farm_summary=farm_summary,
+    )
+    _ai_copilot_panel(
+        farm_data=farm_data,
+        system_data=system_data,
+        selected_farm=selected_farm,
+        farm_summary=farm_summary,
+        simulation=simulation,
+    )
+
+
 def _ai_show_individual_farm_analysis(
     farm_data,
     selected_farm,
@@ -1268,6 +1960,20 @@ def _ai_show_individual_farm_analysis(
         hide_index=True,
     )
 
+    _ai_show_farm_diagnostics(
+        farm_data=farm_data,
+        system_data=system_data,
+        selected_farm=selected_farm,
+        farm_summary=farm_summary,
+    )
+
+    _ai_show_stages_2_3_4(
+        farm_data=farm_data,
+        system_data=system_data,
+        selected_farm=selected_farm,
+        farm_summary=farm_summary,
+    )
+
 
 def ai_platform_page(user):
     """Trang AI Platform chỉ dành cho Admin."""
@@ -1276,7 +1982,7 @@ def ai_platform_page(user):
         return
 
     st.header("🤖 AI Platform – Dự báo chi phí GT35")
-    st.success("Đang chạy bản AI TỪNG TRẠI V2 – 27/07/2026")
+    st.success("Đang chạy bản GT35 AI FULL GIAI ĐOẠN 1–4 – 27/07/2026")
     st.caption(
         "Chọn phạm vi, sau đó bấm nút AI tại đúng phạm vi cần phân tích. "
         "Mục tiêu GT35: mức giảm so với baseline ≥ 35.000 VND/kg."
@@ -1342,8 +2048,10 @@ def ai_platform_page(user):
             use_container_width=True,
             key="run_ai_total",
         )
+        if run_total:
+            st.session_state["ai_total_ready"] = True
 
-        if not run_total:
+        if not st.session_state.get("ai_total_ready", False):
             st.info("Bấm nút AI để chạy phân tích tổng toàn bộ trại.")
             return
 
@@ -1415,8 +2123,11 @@ def ai_platform_page(user):
             use_container_width=True,
             key=f"run_ai_farm_{selected_farm}",
         )
+        farm_ready_key = f"ai_farm_ready_{selected_farm}"
+        if run_farm:
+            st.session_state[farm_ready_key] = True
 
-        if not run_farm:
+        if not st.session_state.get(farm_ready_key, False):
             st.info(
                 f"Bấm nút AI để phân tích riêng trại {selected_farm}. "
                 "Chỉ tiêu thiếu dữ liệu sẽ hiển thị dấu — và ghi chú thiếu dữ liệu."
@@ -1446,7 +2157,7 @@ def main():
         login_page(); return
     with st.sidebar:
         st.markdown("## 🐷 GT35 WEB V4")
-        st.caption("Build: AI-TUNG-TRAI-V2-20260727")
+        st.caption("Build: GT35-AI-FULL-1-4-20260727")
         st.write(f"**{user.get('email')}**")
         st.caption(f"Vai trò: {user.get('role','user')}")
         menu_items=[
