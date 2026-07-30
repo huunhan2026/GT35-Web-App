@@ -24,6 +24,8 @@ from database import (
     seed_farms, load_farms, save_farms, save_record, load_records, delete_record
 )
 
+APP_BUILD = "GT35 NO FARM MANAGER V7 • 30/07/2026 20:01"
+
 st.set_page_config(
     page_title="GT35 – Quản lý trại hậu bị",
     page_icon="🐷", layout="wide", initial_sidebar_state="expanded"
@@ -469,32 +471,52 @@ def farm_management_page(user):
 
 def input_page(user):
     st.header("Nhập dữ liệu giống sheet 02 INPUT DATA")
-    farms=load_farms(include_inactive=False)
-    if farms.empty:
-        st.warning("Chưa có trại. Hãy vào Quản lý trại để thêm trại.")
-        return
+    st.info(
+        "Không cần khai báo trại trong danh mục. Nhập trực tiếp tên trại; "
+        "khi lưu, hệ thống vẫn tổng hợp Dashboard, báo cáo và AI theo tên trại như cũ."
+    )
 
-    names=farms["name"].tolist()
-    assigned=user.get("farm","ALL")
-    if assigned not in ("ALL","",None) and assigned in names:
-        names=[assigned]
+    suggested_names=[]
+    try:
+        old_records=load_records()
+        if old_records is not None and not old_records.empty and "farm" in old_records.columns:
+            suggested_names += old_records["farm"].dropna().astype(str).str.strip().tolist()
+    except Exception:
+        pass
+    suggested_names=sorted({x for x in suggested_names if x})
 
     c1,c2,c3=st.columns([2,1,1])
-    farm_name=c1.selectbox("Chọn trại",names)
+    farm_name=c1.text_input(
+        "Tên trại",
+        placeholder="Nhập chính xác tên trại, ví dụ: TAN HUNG 1",
+        key="manual_farm_name"
+    ).strip()
+    if suggested_names:
+        suggestion=c1.selectbox(
+            "Hoặc chọn nhanh trại đã từng có dữ liệu",
+            [""]+suggested_names,
+            key="farm_name_suggestion"
+        )
+        if suggestion and not farm_name:
+            farm_name=suggestion
+
     mode=c2.radio("Kiểu nhập",["Theo 14 nhóm","Bảng Excel"],horizontal=False)
     reset=c3.button("Tạo phiếu mới",use_container_width=True)
 
-    farm_row=farms[farms["name"]==farm_name].iloc[0].to_dict()
+    if not farm_name:
+        st.warning("Hãy nhập Tên trại để bắt đầu tạo phiếu.")
+        return
+
     record_key=f"record_{farm_name}"
     if reset or record_key not in st.session_state:
-        st.session_state[record_key]=new_record(farm_row)
+        st.session_state[record_key]=new_record({
+            "region":"",
+            "name":farm_name,
+            "capacity":0,
+            "manager":""
+        })
     record=st.session_state[record_key]
-
-    # Always sync farm master fields
-    setv(record,"Khu vực",farm_row.get("region",""))
     setv(record,"Trại",farm_name)
-    setv(record,"Quy mô",farm_row.get("capacity",0))
-    setv(record,"Quản lý trại",farm_row.get("manager",""))
 
     if mode=="Theo 14 nhóm":
         tabs=st.tabs([g.replace("THÔNG TIN CHUNG","THÔNG TIN CHUNG") for g in GROUP_ORDER])
@@ -515,6 +537,7 @@ def input_page(user):
     month=int(val(record,"Tháng",datetime.now().month))
     week_raw=record.get(KEY_BY_VI.get("Tuần"))
     week=str(week_raw).replace(".0","") if week_raw not in (None,"") else ""
+    region=str(record.get(KEY_BY_VI.get("Khu vực")) or "").strip()
     c1.metric("Năm",year)
     c2.metric("Tháng",month)
     c3.metric("Tuần",week or "Chưa nhập")
@@ -525,7 +548,7 @@ def input_page(user):
         if not week:
             st.error("Cần nhập Tuần trong nhóm THÔNG TIN CHUNG.")
         else:
-            meta={"year":year,"month":month,"week":week,"region":farm_row.get("region",""),"farm":farm_name}
+            meta={"year":year,"month":month,"week":week,"region":region,"farm":farm_name}
             ok,msg=save_record(meta,record,user.get("email","unknown"),status)
             st.success(msg) if ok else st.error(msg)
 
@@ -2554,18 +2577,18 @@ def ai_platform_page(user):
 
 def main():
     inject_css()
-    seed_farms(INITIAL_FARMS)
     user=get_current_user()
     if not user:
         login_page(); return
     with st.sidebar:
         st.markdown("## 🐷 GT35 WEB V4")
+        st.success(APP_BUILD)
         st.caption("Copyright © 2026 by Mr. Nguyen Huu Nhan")
         st.write(f"**{user.get('email')}**")
         st.caption(f"Vai trò: {user.get('role','user')}")
         menu_items=[
             "Dashboard","Nhập liệu Input Data","Nhập từ Excel",
-            "Dữ liệu & Báo cáo","Quản lý trại"
+            "Dữ liệu & Báo cáo"
         ]
         if user.get("role")=="admin":
             menu_items.append("AI Platform")
@@ -2582,7 +2605,6 @@ def main():
     elif page=="Nhập từ Excel": import_excel_page(user)
     elif page=="Dữ liệu & Báo cáo": records_page(user)
     elif page=="AI Platform": ai_platform_page(user)
-    else: farm_management_page(user)
 
 if __name__=="__main__":
     main()
