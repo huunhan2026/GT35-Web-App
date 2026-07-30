@@ -1,9 +1,6 @@
 import io
 import json
 import os
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import datetime, date
 
 import numpy as np
@@ -23,8 +20,6 @@ from database import (
     is_supabase_configured, login_user, logout_user, get_current_user,
     seed_farms, load_farms, save_farms, save_record, load_records, delete_record
 )
-
-APP_BUILD = "GT35 NO FARM MANAGER V7 • 30/07/2026 20:01"
 
 st.set_page_config(
     page_title="GT35 – Quản lý trại hậu bị",
@@ -289,234 +284,61 @@ def login_page():
         else: st.error(msg)
     st.info("Chạy thử: admin@gt35.local / admin123")
 
-def _farm_secret(*names):
-    """Lấy cấu hình Supabase từ Streamlit Secrets hoặc biến môi trường."""
-    for name in names:
-        value = os.getenv(name, "")
-        if value:
-            return str(value).strip()
-        try:
-            value = st.secrets.get(name, "")
-            if value:
-                return str(value).strip()
-        except Exception:
-            pass
-    return ""
-
-
-def _farm_rest_request(method, url, key, payload=None):
-    """Gọi Supabase REST bằng thư viện chuẩn, không cần thêm package."""
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url=url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Supabase HTTP {exc.code}: {detail}") from exc
-
-
-def _save_farms_from_management(edited):
-    """
-    Dòng có ID: UPDATE.
-    Dòng mới không có ID: INSERT và để Supabase tự sinh ID.
-    SQLite chạy thử vẫn dùng hàm save_farms cũ.
-    """
-    if edited is None:
-        return False, "Không có dữ liệu để lưu."
-
-    df_save = edited.copy()
-    expected = ["id", "region", "name", "capacity", "manager", "active"]
-    for col in expected:
-        if col not in df_save.columns:
-            df_save[col] = None
-    df_save = df_save[expected]
-
-    # Chế độ SQLite/local: giữ nguyên cơ chế cũ.
-    if not is_supabase_configured():
-        return save_farms(df_save)
-
-    supabase_url = _farm_secret("SUPABASE_URL")
-    supabase_key = _farm_secret(
-        "SUPABASE_KEY",
-        "SUPABASE_ANON_KEY",
-        "SUPABASE_SERVICE_ROLE_KEY",
-    )
-    if not supabase_url or not supabase_key:
-        return False, "Thiếu SUPABASE_URL hoặc SUPABASE_KEY trong Streamlit Secrets."
-
-    base_url = supabase_url.rstrip("/") + "/rest/v1/farms"
-    inserted = 0
-    updated = 0
-    skipped = 0
-
-    for row_no, (_, row) in enumerate(df_save.iterrows(), start=1):
-        region = "" if is_blank(row.get("region")) else str(row.get("region")).strip()
-        farm_name = "" if is_blank(row.get("name")) else str(row.get("name")).strip()
-        manager = "" if is_blank(row.get("manager")) else str(row.get("manager")).strip()
-
-        # Bỏ qua dòng trống cuối bảng.
-        if not region and not farm_name and not manager and is_blank(row.get("capacity")):
-            skipped += 1
-            continue
-
-        if not region:
-            return False, f"Dòng {row_no}: chưa nhập Khu vực."
-        if not farm_name:
-            return False, f"Dòng {row_no}: chưa nhập Tên trại."
-
-        capacity_raw = pd.to_numeric(row.get("capacity"), errors="coerce")
-        capacity = 0 if pd.isna(capacity_raw) else int(capacity_raw)
-
-        active_raw = row.get("active")
-        active = True if is_blank(active_raw) else bool(active_raw)
-
-        payload = {
-            "region": region,
-            "name": farm_name,
-            "capacity": capacity,
-            "manager": manager,
-            "active": active,
-        }
-
-        farm_id = row.get("id")
-        is_new = is_blank(farm_id) or str(farm_id).strip().lower() in {
-            "", "none", "nan", "<na>"
-        }
-
-        if is_new:
-            _farm_rest_request("POST", base_url, supabase_key, payload)
-            inserted += 1
-        else:
-            farm_id_int = int(float(farm_id))
-            query = urllib.parse.urlencode({"id": f"eq.{farm_id_int}"})
-            _farm_rest_request("PATCH", f"{base_url}?{query}", supabase_key, payload)
-            updated += 1
-
-    return True, (
-        f"Đã lưu danh sách trại: thêm mới {inserted}, "
-        f"cập nhật {updated}"
-        + (f", bỏ qua {skipped} dòng trống." if skipped else ".")
-    )
-
-
 def farm_management_page(user):
     st.header("Quản lý danh sách trại")
     if user.get("role") not in ("admin","manager"):
         st.warning("Chỉ Admin hoặc Manager được thay đổi danh sách trại.")
         st.dataframe(load_farms(include_inactive=False),use_container_width=True,hide_index=True)
         return
-
     st.write("Bạn có thể thêm dòng mới, đổi tên trại, khu vực, quy mô, quản lý trại hoặc khóa trại.")
-    st.caption("Dòng mới không cần nhập ID. Hệ thống sẽ tự tạo ID khi lưu.")
-
     df=load_farms(include_inactive=True)
     if df.empty:
         df=pd.DataFrame(columns=["id","region","name","capacity","manager","active"])
-
-    for col in ["id","region","name","capacity","manager","active"]:
-        if col not in df.columns:
-            df[col] = None
-
-    df = df[["id","region","name","capacity","manager","active"]].copy()
-    df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").fillna(0).astype(int)
-    df["active"] = df["active"].apply(
-        lambda value: True if is_blank(value) else bool(value)
-    )
-
     edited=st.data_editor(
-        df,
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        key="farm_management_editor",
+        df[["id","region","name","capacity","manager","active"]],
+        num_rows="dynamic",hide_index=True,use_container_width=True,
         column_config={
-            "id": st.column_config.NumberColumn(
-                "ID",
-                disabled=True,
-                help="ID do hệ thống tự động tạo"
-            ),
+            "id": st.column_config.NumberColumn("ID",disabled=True),
             "region": st.column_config.TextColumn("Khu vực",required=True),
             "name": st.column_config.TextColumn("Tên trại",required=True),
-            "capacity": st.column_config.NumberColumn(
-                "Quy mô",
-                min_value=0,
-                step=100,
-                default=0
-            ),
+            "capacity": st.column_config.NumberColumn("Quy mô",min_value=0,step=100),
             "manager": st.column_config.TextColumn("Quản lý trại"),
-            "active": st.column_config.CheckboxColumn(
-                "Đang hoạt động",
-                default=True
-            ),
+            "active": st.column_config.CheckboxColumn("Đang hoạt động"),
         }
     )
-
     if st.button("Lưu danh sách trại",type="primary"):
-        try:
-            ok,msg=_save_farms_from_management(edited)
-        except Exception as exc:
-            ok,msg=False,str(exc)
-
+        ok,msg=save_farms(edited)
         st.success(msg) if ok else st.error(msg)
-        if ok:
-            st.cache_data.clear()
-            st.rerun()
+        if ok: st.rerun()
 
 def input_page(user):
     st.header("Nhập dữ liệu giống sheet 02 INPUT DATA")
-    st.info(
-        "Không cần khai báo trại trong danh mục. Nhập trực tiếp tên trại; "
-        "khi lưu, hệ thống vẫn tổng hợp Dashboard, báo cáo và AI theo tên trại như cũ."
-    )
+    farms=load_farms(include_inactive=False)
+    if farms.empty:
+        st.warning("Chưa có trại. Hãy vào Quản lý trại để thêm trại.")
+        return
 
-    suggested_names=[]
-    try:
-        old_records=load_records()
-        if old_records is not None and not old_records.empty and "farm" in old_records.columns:
-            suggested_names += old_records["farm"].dropna().astype(str).str.strip().tolist()
-    except Exception:
-        pass
-    suggested_names=sorted({x for x in suggested_names if x})
+    names=farms["name"].tolist()
+    assigned=user.get("farm","ALL")
+    if assigned not in ("ALL","",None) and assigned in names:
+        names=[assigned]
 
     c1,c2,c3=st.columns([2,1,1])
-    farm_name=c1.text_input(
-        "Tên trại",
-        placeholder="Nhập chính xác tên trại, ví dụ: TAN HUNG 1",
-        key="manual_farm_name"
-    ).strip()
-    if suggested_names:
-        suggestion=c1.selectbox(
-            "Hoặc chọn nhanh trại đã từng có dữ liệu",
-            [""]+suggested_names,
-            key="farm_name_suggestion"
-        )
-        if suggestion and not farm_name:
-            farm_name=suggestion
-
+    farm_name=c1.selectbox("Chọn trại",names)
     mode=c2.radio("Kiểu nhập",["Theo 14 nhóm","Bảng Excel"],horizontal=False)
     reset=c3.button("Tạo phiếu mới",use_container_width=True)
 
-    if not farm_name:
-        st.warning("Hãy nhập Tên trại để bắt đầu tạo phiếu.")
-        return
-
+    farm_row=farms[farms["name"]==farm_name].iloc[0].to_dict()
     record_key=f"record_{farm_name}"
     if reset or record_key not in st.session_state:
-        st.session_state[record_key]=new_record({
-            "region":"",
-            "name":farm_name,
-            "capacity":0,
-            "manager":""
-        })
+        st.session_state[record_key]=new_record(farm_row)
     record=st.session_state[record_key]
+
+    # Always sync farm master fields
+    setv(record,"Khu vực",farm_row.get("region",""))
     setv(record,"Trại",farm_name)
+    setv(record,"Quy mô",farm_row.get("capacity",0))
+    setv(record,"Quản lý trại",farm_row.get("manager",""))
 
     if mode=="Theo 14 nhóm":
         tabs=st.tabs([g.replace("THÔNG TIN CHUNG","THÔNG TIN CHUNG") for g in GROUP_ORDER])
@@ -537,7 +359,6 @@ def input_page(user):
     month=int(val(record,"Tháng",datetime.now().month))
     week_raw=record.get(KEY_BY_VI.get("Tuần"))
     week=str(week_raw).replace(".0","") if week_raw not in (None,"") else ""
-    region=str(record.get(KEY_BY_VI.get("Khu vực")) or "").strip()
     c1.metric("Năm",year)
     c2.metric("Tháng",month)
     c3.metric("Tuần",week or "Chưa nhập")
@@ -548,7 +369,7 @@ def input_page(user):
         if not week:
             st.error("Cần nhập Tuần trong nhóm THÔNG TIN CHUNG.")
         else:
-            meta={"year":year,"month":month,"week":week,"region":region,"farm":farm_name}
+            meta={"year":year,"month":month,"week":week,"region":farm_row.get("region",""),"farm":farm_name}
             ok,msg=save_record(meta,record,user.get("email","unknown"),status)
             st.success(msg) if ok else st.error(msg)
 
@@ -2577,18 +2398,18 @@ def ai_platform_page(user):
 
 def main():
     inject_css()
+    seed_farms(INITIAL_FARMS)
     user=get_current_user()
     if not user:
         login_page(); return
     with st.sidebar:
         st.markdown("## 🐷 GT35 WEB V4")
-        st.success(APP_BUILD)
         st.caption("Copyright © 2026 by Mr. Nguyen Huu Nhan")
         st.write(f"**{user.get('email')}**")
         st.caption(f"Vai trò: {user.get('role','user')}")
         menu_items=[
             "Dashboard","Nhập liệu Input Data","Nhập từ Excel",
-            "Dữ liệu & Báo cáo"
+            "Dữ liệu & Báo cáo","Quản lý trại"
         ]
         if user.get("role")=="admin":
             menu_items.append("AI Platform")
@@ -2605,6 +2426,7 @@ def main():
     elif page=="Nhập từ Excel": import_excel_page(user)
     elif page=="Dữ liệu & Báo cáo": records_page(user)
     elif page=="AI Platform": ai_platform_page(user)
+    else: farm_management_page(user)
 
 if __name__=="__main__":
     main()
