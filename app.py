@@ -21,7 +21,8 @@ from database import (
     seed_farms, load_farms, save_farms, save_record, load_records, delete_record
 )
 
-APP_BUILD = "GT35 EXCEL HEADER FIX V9 • 30/07/2026 20:27"
+APP_BUILD = "GT35 FARM INPUT V8 • 30/07/2026 20:13"
+FARM_CATALOG_STATUS = "Danh mục trại"
 
 st.set_page_config(
     page_title="GT35 – Quản lý trại hậu bị",
@@ -286,93 +287,416 @@ def login_page():
         else: st.error(msg)
     st.info("Chạy thử: admin@gt35.local / admin123")
 
+
+def _clean_text(value):
+    return "" if is_blank(value) else str(value).strip()
+
+
+def _load_known_farms():
+    """
+    Lấy danh sách trại từ dữ liệu đã lưu. Không phụ thuộc bảng farms,
+    vì bảng farms đang bị Supabase RLS chặn khi thêm mới.
+    """
+    rows = []
+
+    # Ưu tiên dữ liệu thật đã lưu trong records.
+    try:
+        records = load_records()
+        if records is not None and not records.empty:
+            farm_key = KEY_BY_VI.get("Trại")
+            region_key = KEY_BY_VI.get("Khu vực")
+            capacity_key = KEY_BY_VI.get("Quy mô")
+            manager_key = KEY_BY_VI.get("Quản lý trại")
+
+            for _, rec in records.iterrows():
+                farm_name = _clean_text(
+                    rec.get("farm") or (rec.get(farm_key) if farm_key else "")
+                )
+                if not farm_name:
+                    continue
+                rows.append({
+                    "region": _clean_text(
+                        rec.get("region") or (rec.get(region_key) if region_key else "")
+                    ),
+                    "name": farm_name,
+                    "capacity": rec.get(capacity_key, 0) if capacity_key else 0,
+                    "manager": _clean_text(rec.get(manager_key, "")) if manager_key else "",
+                    "active": True,
+                })
+    except Exception:
+        pass
+
+    # Đọc danh mục cũ nếu còn sử dụng được, nhưng không bắt buộc.
+    try:
+        old = load_farms(include_inactive=True)
+        if old is not None and not old.empty:
+            for _, rec in old.iterrows():
+                farm_name = _clean_text(rec.get("name"))
+                if not farm_name:
+                    continue
+                rows.append({
+                    "region": _clean_text(rec.get("region")),
+                    "name": farm_name,
+                    "capacity": rec.get("capacity", 0),
+                    "manager": _clean_text(rec.get("manager")),
+                    "active": bool(rec.get("active", True)),
+                })
+    except Exception:
+        pass
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["region", "name", "capacity", "manager", "active"]
+        )
+
+    df = pd.DataFrame(rows)
+    df["name_key"] = df["name"].astype(str).str.strip().str.upper()
+    df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").fillna(0).astype(int)
+    df = df.sort_values(["name_key"]).drop_duplicates("name_key", keep="last")
+    return df.drop(columns=["name_key"]).reset_index(drop=True)
+
+
+def _save_farm_catalog_record(region, name, capacity, manager, user):
+    """
+    Lưu trại vào bảng records bằng một phiếu danh mục đặc biệt.
+    Cách này dùng chính hàm save_record vốn đang hoạt động, không ghi vào bảng farms.
+    """
+    farm_name = _clean_text(name)
+    farm_region = _clean_text(region)
+    farm_manager = _clean_text(manager)
+
+    if not farm_name:
+        return False, "Tên trại không được để trống."
+
+    capacity_value = pd.to_numeric(capacity, errors="coerce")
+    capacity_value = 0 if pd.isna(capacity_value) else int(capacity_value)
+
+    record = new_record({
+        "region": farm_region,
+        "name": farm_name,
+        "capacity": capacity_value,
+        "manager": farm_manager,
+    })
+    setv(record, "Khu vực", farm_region)
+    setv(record, "Trại", farm_name)
+    setv(record, "Quy mô", capacity_value)
+    setv(record, "Quản lý trại", farm_manager)
+    setv(record, "Tuần", 0)
+
+    today = date.today()
+    meta = {
+        "year": today.year,
+        "month": today.month,
+        "week": "0",
+        "region": farm_region,
+        "farm": farm_name,
+    }
+    return save_record(
+        meta,
+        record,
+        user.get("email", "unknown"),
+        FARM_CATALOG_STATUS,
+    )
+
+
+def _read_farm_list_excel(uploaded):
+    raw = pd.read_excel(uploaded, sheet_name=0)
+    if raw.empty:
+        return pd.DataFrame()
+
+    normalized = {
+        str(col).strip().lower()
+        .replace("_", " ")
+        .replace("-", " "): col
+        for col in raw.columns
+    }
+
+    aliases = {
+        "region": ["khu vực", "khu vuc", "region"],
+        "name": ["tên trại", "ten trai", "trại", "trai", "farm", "farm name"],
+        "capacity": ["quy mô", "quy mo", "capacity"],
+        "manager": ["quản lý trại", "quan ly trai", "quản lý", "quan ly", "manager"],
+    }
+
+    rename = {}
+    for target, names in aliases.items():
+        for alias in names:
+            if alias in normalized:
+                rename[normalized[alias]] = target
+                break
+
+    if "name" not in rename.values():
+        raise ValueError("File Excel phải có cột 'Tên trại'.")
+
+    df = raw.rename(columns=rename)
+    for col in ["region", "name", "capacity", "manager"]:
+        if col not in df.columns:
+            df[col] = "" if col != "capacity" else 0
+
+    df = df[["region", "name", "capacity", "manager"]].copy()
+    df["region"] = df["region"].fillna("").astype(str).str.strip()
+    df["name"] = df["name"].fillna("").astype(str).str.strip()
+    df["manager"] = df["manager"].fillna("").astype(str).str.strip()
+    df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").fillna(0).astype(int)
+    df = df[df["name"] != ""]
+    df["_key"] = df["name"].str.upper().str.strip()
+    df = df.drop_duplicates("_key", keep="last").drop(columns="_key")
+    return df.reset_index(drop=True)
+
+
+def _farm_excel_template_bytes():
+    output = io.BytesIO()
+    sample = pd.DataFrame([{
+        "Khu vực": "BÌNH PHƯỚC",
+        "Tên trại": "TEN TRAI MOI",
+        "Quy mô": 12000,
+        "Quản lý trại": "NGUYEN VAN A",
+    }])
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sample.to_excel(writer, index=False, sheet_name="Danh sach trai")
+        ws = writer.book["Danh sach trai"]
+        for cell in ws[1]:
+            cell.fill = PatternFill("solid", fgColor="1F6B4A")
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center")
+        ws.freeze_panes = "A2"
+        for idx, width in enumerate([22, 26, 14, 24], start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = width
+    return output.getvalue()
+
+
 def farm_management_page(user):
     st.header("Quản lý danh sách trại")
-    if user.get("role") not in ("admin","manager"):
-        st.warning("Chỉ Admin hoặc Manager được thay đổi danh sách trại.")
-        st.dataframe(load_farms(include_inactive=False),use_container_width=True,hide_index=True)
+    st.caption(APP_BUILD)
+
+    if user.get("role") not in ("admin", "manager"):
+        st.warning("Chỉ Admin hoặc Manager được thêm danh sách trại.")
+        st.dataframe(_load_known_farms(), use_container_width=True, hide_index=True)
         return
-    st.write("Bạn có thể thêm dòng mới, đổi tên trại, khu vực, quy mô, quản lý trại hoặc khóa trại.")
-    df=load_farms(include_inactive=True)
-    if df.empty:
-        df=pd.DataFrame(columns=["id","region","name","capacity","manager","active"])
-    edited=st.data_editor(
-        df[["id","region","name","capacity","manager","active"]],
-        num_rows="dynamic",hide_index=True,use_container_width=True,
-        column_config={
-            "id": st.column_config.NumberColumn("ID",disabled=True),
-            "region": st.column_config.TextColumn("Khu vực",required=True),
-            "name": st.column_config.TextColumn("Tên trại",required=True),
-            "capacity": st.column_config.NumberColumn("Quy mô",min_value=0,step=100),
-            "manager": st.column_config.TextColumn("Quản lý trại"),
-            "active": st.column_config.CheckboxColumn("Đang hoạt động"),
-        }
+
+    st.info(
+        "Danh sách trại được lưu bằng phiếu danh mục trong dữ liệu GT35, "
+        "không ghi vào bảng farms nên không bị lỗi RLS. "
+        "Các phiếu danh mục không được đưa vào Dashboard và AI."
     )
-    if st.button("Lưu danh sách trại",type="primary"):
-        ok,msg=save_farms(edited)
-        st.success(msg) if ok else st.error(msg)
-        if ok: st.rerun()
+
+    tab1, tab2, tab3 = st.tabs(
+        ["Nhập trại thủ công", "Nhập từ Excel", "Danh sách hiện có"]
+    )
+
+    with tab1:
+        with st.form("manual_farm_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            region = c1.text_input("Khu vực")
+            name = c2.text_input("Tên trại *")
+            capacity = c1.number_input("Quy mô", min_value=0, step=100, value=0)
+            manager = c2.text_input("Quản lý trại")
+            submit = st.form_submit_button(
+                "THÊM TRẠI",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if submit:
+            ok, msg = _save_farm_catalog_record(
+                region, name, capacity, manager, user
+            )
+            if ok:
+                st.success(msg)
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(msg)
+
+    with tab2:
+        st.download_button(
+            "Tải file Excel mẫu danh sách trại",
+            data=_farm_excel_template_bytes(),
+            file_name="Mau danh sach trai GT35.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        uploaded = st.file_uploader(
+            "Chọn file Excel danh sách trại",
+            type=["xlsx"],
+            key="farm_catalog_excel",
+        )
+
+        if uploaded is not None:
+            try:
+                imported = _read_farm_list_excel(uploaded)
+                st.success(f"Đã đọc {len(imported)} trại.")
+                st.dataframe(imported, use_container_width=True, hide_index=True)
+
+                confirm = st.checkbox(
+                    "Tôi xác nhận nhập danh sách trại này",
+                    key="confirm_farm_catalog_excel",
+                )
+                if st.button(
+                    "NHẬP TOÀN BỘ DANH SÁCH TRẠI",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not confirm,
+                ):
+                    success_count = 0
+                    errors = []
+                    for _, row in imported.iterrows():
+                        ok, msg = _save_farm_catalog_record(
+                            row["region"],
+                            row["name"],
+                            row["capacity"],
+                            row["manager"],
+                            user,
+                        )
+                        if ok:
+                            success_count += 1
+                        else:
+                            errors.append(f"{row['name']}: {msg}")
+
+                    if errors:
+                        st.warning(
+                            f"Đã nhập {success_count} trại; lỗi {len(errors)} trại. "
+                            f"Lỗi đầu tiên: {errors[0]}"
+                        )
+                    else:
+                        st.success(f"Đã nhập thành công {success_count} trại.")
+                    st.cache_data.clear()
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Không đọc được file Excel: {exc}")
+
+    with tab3:
+        known = _load_known_farms()
+        if known.empty:
+            st.info("Chưa có trại nào.")
+        else:
+            st.caption(f"Đang có {len(known)} trại.")
+            st.dataframe(known, use_container_width=True, hide_index=True)
+
 
 def input_page(user):
     st.header("Nhập dữ liệu giống sheet 02 INPUT DATA")
-    farms=load_farms(include_inactive=False)
-    if farms.empty:
-        st.warning("Chưa có trại. Hãy vào Quản lý trại để thêm trại.")
+
+    known = _load_known_farms()
+    known_names = known["name"].tolist() if not known.empty else []
+
+    assigned = user.get("farm", "ALL")
+    if assigned not in ("ALL", "", None):
+        known_names = [assigned]
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    farm_mode = c1.radio(
+        "Chọn cách nhập tên trại",
+        ["Chọn từ danh sách", "Nhập tên trại mới"],
+        horizontal=True,
+    )
+
+    if farm_mode == "Chọn từ danh sách" and known_names:
+        farm_name = c1.selectbox("Chọn trại", known_names)
+    else:
+        farm_name = c1.text_input(
+            "Tên trại",
+            placeholder="Nhập chính xác tên trại",
+        ).strip()
+
+    mode = c2.radio(
+        "Kiểu nhập",
+        ["Theo 14 nhóm", "Bảng Excel"],
+        horizontal=False,
+    )
+    reset = c3.button("Tạo phiếu mới", use_container_width=True)
+
+    if not farm_name:
+        st.warning(
+            "Chưa có tên trại. Bạn có thể nhập trực tiếp tên trại mới "
+            "hoặc vào Quản lý trại để thêm bằng Excel."
+        )
         return
 
-    names=farms["name"].tolist()
-    assigned=user.get("farm","ALL")
-    if assigned not in ("ALL","",None) and assigned in names:
-        names=[assigned]
+    farm_row = {
+        "region": "",
+        "name": farm_name,
+        "capacity": 0,
+        "manager": "",
+    }
+    if not known.empty:
+        matched = known[
+            known["name"].astype(str).str.strip().str.upper()
+            == farm_name.strip().upper()
+        ]
+        if not matched.empty:
+            farm_row = matched.iloc[0].to_dict()
 
-    c1,c2,c3=st.columns([2,1,1])
-    farm_name=c1.selectbox("Chọn trại",names)
-    mode=c2.radio("Kiểu nhập",["Theo 14 nhóm","Bảng Excel"],horizontal=False)
-    reset=c3.button("Tạo phiếu mới",use_container_width=True)
-
-    farm_row=farms[farms["name"]==farm_name].iloc[0].to_dict()
-    record_key=f"record_{farm_name}"
+    record_key = f"record_{farm_name}"
     if reset or record_key not in st.session_state:
-        st.session_state[record_key]=new_record(farm_row)
-    record=st.session_state[record_key]
+        st.session_state[record_key] = new_record(farm_row)
+    record = st.session_state[record_key]
 
-    # Always sync farm master fields
-    setv(record,"Khu vực",farm_row.get("region",""))
-    setv(record,"Trại",farm_name)
-    setv(record,"Quy mô",farm_row.get("capacity",0))
-    setv(record,"Quản lý trại",farm_row.get("manager",""))
+    # Đồng bộ thông tin trại từ danh sách; người dùng vẫn có thể sửa
+    # trong nhóm THÔNG TIN CHUNG.
+    setv(record, "Khu vực", farm_row.get("region", ""))
+    setv(record, "Trại", farm_name)
+    setv(record, "Quy mô", farm_row.get("capacity", 0))
+    setv(record, "Quản lý trại", farm_row.get("manager", ""))
 
-    if mode=="Theo 14 nhóm":
-        tabs=st.tabs([g.replace("THÔNG TIN CHUNG","THÔNG TIN CHUNG") for g in GROUP_ORDER])
-        for idx,(tab,group) in enumerate(zip(tabs,GROUP_ORDER)):
+    if mode == "Theo 14 nhóm":
+        tabs = st.tabs(GROUP_ORDER)
+        for idx, (tab, group) in enumerate(zip(tabs, GROUP_ORDER)):
             with tab:
-                record=render_group_editor(record,group,idx)
+                record = render_group_editor(record, group, idx)
     else:
-        group=st.selectbox("Chọn nhóm cột để nhập",GROUP_ORDER)
-        record=render_group_editor(record,group,100+GROUP_ORDER.index(group))
-        st.info("Dữ liệu của các nhóm khác vẫn được giữ trong phiếu. Chọn nhóm khác để tiếp tục nhập.")
+        group = st.selectbox("Chọn nhóm cột để nhập", GROUP_ORDER)
+        record = render_group_editor(
+            record,
+            group,
+            100 + GROUP_ORDER.index(group),
+        )
+        st.info(
+            "Dữ liệu của các nhóm khác vẫn được giữ trong phiếu. "
+            "Chọn nhóm khác để tiếp tục nhập."
+        )
 
-    record=recalculate(record)
-    st.session_state[record_key]=record
+    record = recalculate(record)
+    st.session_state[record_key] = record
 
     st.divider()
-    c1,c2,c3,c4=st.columns(4)
-    year=int(val(record,"Năm",datetime.now().year))
-    month=int(val(record,"Tháng",datetime.now().month))
-    week_raw=record.get(KEY_BY_VI.get("Tuần"))
-    week=str(week_raw).replace(".0","") if week_raw not in (None,"") else ""
-    c1.metric("Năm",year)
-    c2.metric("Tháng",month)
-    c3.metric("Tuần",week or "Chưa nhập")
-    c4.metric("Trại",farm_name)
+    c1, c2, c3, c4 = st.columns(4)
+    year = int(val(record, "Năm", datetime.now().year))
+    month = int(val(record, "Tháng", datetime.now().month))
+    week_raw = record.get(KEY_BY_VI.get("Tuần"))
+    week = str(week_raw).replace(".0", "") if week_raw not in (None, "") else ""
+    region = _clean_text(record.get(KEY_BY_VI.get("Khu vực")))
 
-    status=st.selectbox("Trạng thái phiếu",["Nháp","Đã gửi","Đã duyệt","Đã khóa"])
-    if st.button("LƯU TOÀN BỘ PHIẾU",type="primary",use_container_width=True):
+    c1.metric("Năm", year)
+    c2.metric("Tháng", month)
+    c3.metric("Tuần", week or "Chưa nhập")
+    c4.metric("Trại", farm_name)
+
+    status = st.selectbox(
+        "Trạng thái phiếu",
+        ["Nháp", "Đã gửi", "Đã duyệt", "Đã khóa"],
+    )
+    if st.button(
+        "LƯU TOÀN BỘ PHIẾU",
+        type="primary",
+        use_container_width=True,
+    ):
         if not week:
             st.error("Cần nhập Tuần trong nhóm THÔNG TIN CHUNG.")
         else:
-            meta={"year":year,"month":month,"week":week,"region":farm_row.get("region",""),"farm":farm_name}
-            ok,msg=save_record(meta,record,user.get("email","unknown"),status)
+            meta = {
+                "year": year,
+                "month": month,
+                "week": week,
+                "region": region,
+                "farm": farm_name,
+            }
+            ok, msg = save_record(
+                meta,
+                record,
+                user.get("email", "unknown"),
+                status,
+            )
             st.success(msg) if ok else st.error(msg)
 
 def import_excel_page(user):
@@ -396,80 +720,17 @@ def import_excel_page(user):
         return
 
     sh=book["02 INPUT DATA"]
-
-    # Tự động tìm dòng tiêu đề tiếng Việt.
-    # File mẫu GT35:
-    # Dòng 1 = tên nhóm; dòng 2 = tiêu đề tiếng Việt;
-    # dòng 3 = tiêu đề tiếng Anh; dữ liệu bắt đầu từ dòng 4.
-    header_row = None
-    best_match_count = 0
-
-    for candidate_row in range(1, min(sh.max_row, 10) + 1):
-        candidate_headers = [
-            sh.cell(candidate_row, c).value
-            for c in range(1, sh.max_column + 1)
-        ]
-        match_count = sum(
-            1
-            for h in candidate_headers
-            if h is not None and str(h).strip() in KEY_BY_VI
-        )
-
-        if match_count > best_match_count:
-            best_match_count = match_count
-            header_row = candidate_row
-
-    if header_row is None or best_match_count == 0:
-        st.error(
-            "Không tìm thấy dòng tiêu đề tiếng Việt phù hợp trong sheet "
-            "'02 INPUT DATA'. Hãy dùng đúng file mẫu GT35."
-        )
-        return
-
-    headers = [
-        sh.cell(header_row, c).value
-        for c in range(1, sh.max_column + 1)
-    ]
-
-    rows = []
-    unmapped_headers = []
-
-    for r in range(header_row + 1, sh.max_row + 1):
-        values = [
-            sh.cell(r, c).value
-            for c in range(1, sh.max_column + 1)
-        ]
-
-        if not any(v not in (None, "") for v in values):
+    headers=[sh.cell(3,c).value for c in range(1,sh.max_column+1)]
+    rows=[]
+    for r in range(4,sh.max_row+1):
+        values=[sh.cell(r,c).value for c in range(1,sh.max_column+1)]
+        if not any(v not in (None,"") for v in values):
             continue
-
-        record = {f["key"]: None for f in FIELD_DEFS}
-        matched_fields = 0
-
-        for h, v in zip(headers, values):
-            if h is None:
-                continue
-
-            header_name = str(h).strip()
-            key = KEY_BY_VI.get(header_name)
-
-            if key:
-                record[key] = v
-                matched_fields += 1
-            elif header_name and header_name not in unmapped_headers:
-                unmapped_headers.append(header_name)
-
-        if matched_fields > 0:
-            rows.append(recalculate(record))
-
-    st.caption(
-        f"Đã tự nhận diện dòng tiêu đề: dòng {header_row} "
-        f"({best_match_count} cột khớp cấu trúc GT35)."
-    )
-
-    if unmapped_headers:
-        with st.expander("Các cột trong Excel chưa khớp cấu hình hệ thống"):
-            st.write(", ".join(unmapped_headers))
+        record={f["key"]: None for f in FIELD_DEFS}
+        for h,v in zip(headers,values):
+            if h and str(h).strip() in KEY_BY_VI:
+                record[KEY_BY_VI[str(h).strip()]]=v
+        rows.append(recalculate(record))
 
     if not rows:
         st.warning("File không có dòng dữ liệu trong sheet 02 INPUT DATA.")
@@ -532,6 +793,8 @@ def import_excel_page(user):
 def records_page(user):
     st.header("Dữ liệu và báo cáo")
     df=load_records()
+    if df is not None and not df.empty and "status" in df.columns:
+        df=df[df["status"].astype(str)!=FARM_CATALOG_STATUS].copy()
     if df.empty:
         st.info("Chưa có dữ liệu.")
         return
@@ -758,6 +1021,8 @@ def dashboard_page():
     st.header("Dashboard GT35")
 
     df = load_records()
+    if df is not None and not df.empty and "status" in df.columns:
+        df = df[df["status"].astype(str) != FARM_CATALOG_STATUS].copy()
 
     # Luôn hiển thị Dashboard tổng hợp và 14 hạng mục, kể cả khi chưa có dữ liệu.
     # Khi chưa có bản ghi, mỗi phần sẽ báo "Chưa có dữ liệu" thay vì dừng toàn trang.
@@ -2301,6 +2566,8 @@ def ai_platform_page(user):
     )
 
     raw = load_records()
+    if raw is not None and not raw.empty and "status" in raw.columns:
+        raw = raw[raw["status"].astype(str) != FARM_CATALOG_STATUS].copy()
     if raw is None or raw.empty:
         st.warning("Hệ thống chưa có dữ liệu đã lưu.")
         return
@@ -2463,7 +2730,6 @@ def ai_platform_page(user):
 
 def main():
     inject_css()
-    seed_farms(INITIAL_FARMS)
     user=get_current_user()
     if not user:
         login_page(); return
