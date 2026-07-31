@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import time
 from datetime import datetime, date
 
 import numpy as np
@@ -21,7 +22,7 @@ from database import (
     seed_farms, load_farms, save_farms, save_record, load_records, delete_record
 )
 
-APP_BUILD = "GT35 FARM INPUT V8 • 30/07/2026 20:13"
+APP_BUILD = "GT35 MULTI-USER EXCEL V9 • 31/07/2026 18:46"
 FARM_CATALOG_STATUS = "Danh mục trại"
 
 st.set_page_config(
@@ -699,96 +700,330 @@ def input_page(user):
             )
             st.success(msg) if ok else st.error(msg)
 
+def _normalize_excel_header(value):
+    if value is None:
+        return ""
+    return " ".join(
+        str(value)
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("\xa0", " ")
+        .strip()
+        .split()
+    )
+
+
+def _find_gt35_template_file():
+    candidates = [
+        "GT35 Project Mau.xlsx",
+        "GT35 Project Mau(2).xlsx",
+        "Mau Input Data GT35.xlsx",
+    ]
+    for filename in candidates:
+        if os.path.exists(filename):
+            return filename
+    return None
+
+
+def _save_record_with_retry(meta, record, created_by, status, retries=3):
+    last_message = ""
+    for attempt in range(1, retries + 1):
+        try:
+            ok, message = save_record(
+                meta,
+                record,
+                created_by,
+                status,
+            )
+            if ok:
+                return True, message
+            last_message = str(message)
+        except Exception as exc:
+            last_message = str(exc)
+
+        if attempt < retries:
+            time.sleep(0.6 * attempt)
+
+    return False, last_message or "Không xác định được lỗi lưu dữ liệu."
+
+
 def import_excel_page(user):
     st.header("Nhập từ file Excel đúng mẫu")
-    st.write("Sau khi chọn file, hệ thống sẽ hiển thị toàn bộ dữ liệu theo từng nhóm của sheet 02 INPUT DATA.")
-    with open("Mau Input Data GT35.xlsx","rb") as f:
-        st.download_button("Tải file mẫu gốc",f.read(),"Mau Input Data GT35.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    uploaded=st.file_uploader("Chọn file GT35 Excel",type=["xlsx"])
+    st.write(
+        "Hệ thống đọc đúng mẫu **GT35 Project Mau**: "
+        "dòng 1 là nhóm, dòng 2 là tiếng Anh, dòng 3 là tiêu đề tiếng Việt "
+        "và dữ liệu bắt đầu từ dòng 4."
+    )
+    st.info(
+        "Nhiều người có thể nhập cùng lúc. Mỗi file được xử lý trong session "
+        "riêng; các trại khác nhau được lưu độc lập và không ghi đè lẫn nhau."
+    )
+
+    template_path = _find_gt35_template_file()
+    if template_path:
+        with open(template_path, "rb") as f:
+            st.download_button(
+                "Tải file mẫu GT35 Project Mau",
+                f.read(),
+                "GT35 Project Mau.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+    else:
+        st.warning(
+            "Chưa tìm thấy file mẫu trong repository. "
+            "Hãy tải file 'GT35 Project Mau.xlsx' lên cùng thư mục với app.py."
+        )
+
+    uploaded = st.file_uploader(
+        "Chọn file GT35 Excel",
+        type=["xlsx"],
+        key="gt35_excel_upload_multi_user",
+    )
     if not uploaded:
         return
 
     try:
-        book=load_workbook(uploaded,data_only=True)
-    except Exception as e:
-        st.error(f"Không đọc được file Excel: {e}")
+        book = load_workbook(uploaded, data_only=True, read_only=False)
+    except Exception as exc:
+        st.error(f"Không đọc được file Excel: {exc}")
         return
 
     if "02 INPUT DATA" not in book.sheetnames:
         st.error("Không tìm thấy sheet '02 INPUT DATA'.")
         return
 
-    sh=book["02 INPUT DATA"]
-    headers=[sh.cell(3,c).value for c in range(1,sh.max_column+1)]
-    rows=[]
-    for r in range(4,sh.max_row+1):
-        values=[sh.cell(r,c).value for c in range(1,sh.max_column+1)]
-        if not any(v not in (None,"") for v in values):
-            continue
-        record={f["key"]: None for f in FIELD_DEFS}
-        for h,v in zip(headers,values):
-            if h and str(h).strip() in KEY_BY_VI:
-                record[KEY_BY_VI[str(h).strip()]]=v
-        rows.append(recalculate(record))
+    sh = book["02 INPUT DATA"]
 
-    if not rows:
-        st.warning("File không có dòng dữ liệu trong sheet 02 INPUT DATA.")
+    header_row = 3
+    data_start_row = 4
+    headers = [
+        _normalize_excel_header(sh.cell(header_row, col).value)
+        for col in range(1, sh.max_column + 1)
+    ]
+
+    header_aliases = {
+        "Mục tiêu tỷ lệ chọn giống (%)": "Tỷ lệ chọn giống mục tiêu (%)",
+        "Lượng cám hao hụt (kg)": "Cám hao hụt (kg)",
+    }
+
+    mapped_headers = []
+    matched_count = 0
+    for header in headers:
+        normalized = header_aliases.get(header, header)
+        mapped_headers.append(normalized)
+        if normalized in KEY_BY_VI:
+            matched_count += 1
+
+    if matched_count < 5:
+        st.error(
+            "Dòng 3 không khớp cấu trúc ứng dụng. "
+            f"Chỉ nhận diện được {matched_count} cột."
+        )
         return
 
-    # Tóm tắt nhanh
-    summary=[]
-    for record in rows:
-        summary.append({
-            "Năm": record.get(KEY_BY_VI.get("Năm")),
-            "Tháng": record.get(KEY_BY_VI.get("Tháng")),
-            "Tuần": record.get(KEY_BY_VI.get("Tuần")),
-            "Khu vực": record.get(KEY_BY_VI.get("Khu vực")),
-            "Trại": record.get(KEY_BY_VI.get("Trại")),
-        })
-    st.success(f"Đã đọc {len(rows)} dòng và {len(FIELD_DEFS)} cột dữ liệu.")
-    st.subheader("Kiểm tra tổng quan")
-    st.dataframe(pd.DataFrame(summary),use_container_width=True,hide_index=True,height=300)
+    rows = []
+    row_sources = []
 
-    # Hiển thị toàn bộ dữ liệu theo từng nhóm/tab
+    for excel_row in range(data_start_row, sh.max_row + 1):
+        values = [
+            sh.cell(excel_row, col).value
+            for col in range(1, sh.max_column + 1)
+        ]
+
+        if not any(value not in (None, "") for value in values):
+            continue
+
+        record = {field["key"]: None for field in FIELD_DEFS}
+        for header, value in zip(mapped_headers, values):
+            if header and header in KEY_BY_VI:
+                record[KEY_BY_VI[header]] = value
+
+        year = int(val(record, "Năm", 0))
+        month = int(val(record, "Tháng", 0))
+        week_raw = record.get(KEY_BY_VI.get("Tuần"))
+        week = str(week_raw or "").replace(".0", "").strip()
+        farm = str(record.get(KEY_BY_VI.get("Trại")) or "").strip()
+        region = str(record.get(KEY_BY_VI.get("Khu vực")) or "").strip()
+
+        rows.append(recalculate(record))
+        row_sources.append({
+            "excel_row": excel_row,
+            "year": year,
+            "month": month,
+            "week": week,
+            "farm": farm,
+            "region": region,
+        })
+
+    if not rows:
+        st.warning("File không có dòng dữ liệu từ dòng 4 trở đi.")
+        return
+
+    duplicate_keys = {}
+    invalid_rows = []
+
+    for index, source in enumerate(row_sources):
+        if not source["year"] or not source["week"] or not source["farm"]:
+            invalid_rows.append(source["excel_row"])
+            continue
+
+        key = (
+            int(source["year"]),
+            str(source["week"]).strip(),
+            str(source["farm"]).strip().upper(),
+        )
+        duplicate_keys.setdefault(key, []).append(index)
+
+    duplicates = {
+        key: indexes
+        for key, indexes in duplicate_keys.items()
+        if len(indexes) > 1
+    }
+
+    st.success(
+        f"Đã đọc {len(rows)} dòng dữ liệu; nhận diện {matched_count} cột hợp lệ."
+    )
+
+    summary = pd.DataFrame([
+        {
+            "Dòng Excel": source["excel_row"],
+            "Năm": source["year"] or None,
+            "Tháng": source["month"] or None,
+            "Tuần": source["week"] or None,
+            "Khu vực": source["region"] or None,
+            "Trại": source["farm"] or None,
+            "Kiểm tra": (
+                "Thiếu Năm/Tuần/Trại"
+                if source["excel_row"] in invalid_rows
+                else "Hợp lệ"
+            ),
+        }
+        for source in row_sources
+    ])
+
+    st.subheader("Kiểm tra tổng quan")
+    st.dataframe(
+        summary,
+        use_container_width=True,
+        hide_index=True,
+        height=320,
+    )
+
+    if invalid_rows:
+        st.error(
+            "Các dòng sau thiếu Năm, Tuần hoặc Trại nên sẽ không được nhập: "
+            + ", ".join(map(str, invalid_rows))
+        )
+
+    if duplicates:
+        duplicate_text = []
+        for key, indexes in list(duplicates.items())[:10]:
+            excel_rows = [row_sources[i]["excel_row"] for i in indexes]
+            duplicate_text.append(
+                f"{key[2]} – năm {key[0]} – tuần {key[1]} "
+                f"(dòng {', '.join(map(str, excel_rows))})"
+            )
+        st.error(
+            "File có bản ghi trùng Năm + Tuần + Trại. "
+            "Hãy giữ lại một dòng cho mỗi khóa:\n\n"
+            + "\n\n".join(duplicate_text)
+        )
+
     st.subheader("Dữ liệu chi tiết theo nhóm")
-    tabs=st.tabs(GROUP_ORDER)
-    for tab,group in zip(tabs,GROUP_ORDER):
+    tabs = st.tabs(GROUP_ORDER)
+    for tab, group in zip(tabs, GROUP_ORDER):
         with tab:
-            fields=[f for f in FIELD_DEFS if f["group"]==group]
-            group_data=[]
-            for record in rows:
-                group_data.append({f["vi"]: record.get(f["key"]) for f in fields})
-            group_df=format_display_table(pd.DataFrame(group_data))
+            fields = [field for field in FIELD_DEFS if field["group"] == group]
+            group_data = [
+                {
+                    field["vi"]: record.get(field["key"])
+                    for field in fields
+                }
+                for record in rows
+            ]
+            group_df = format_display_table(pd.DataFrame(group_data))
             st.caption(f"{len(fields)} cột • {len(group_df)} dòng")
-            st.dataframe(group_df,use_container_width=True,hide_index=True,height=420)
+            st.dataframe(
+                group_df,
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+            )
 
     st.divider()
-    confirm=st.checkbox("Tôi đã kiểm tra dữ liệu và đồng ý nhập toàn bộ vào hệ thống")
-    if st.button("NHẬP TOÀN BỘ DỮ LIỆU",type="primary",use_container_width=True,disabled=not confirm):
-        ok_count=0
-        errors=[]
-        for record in rows:
-            year=int(val(record,"Năm",0))
-            month=int(val(record,"Tháng",0))
-            week=str(record.get(KEY_BY_VI.get("Tuần")) or "").replace(".0","")
-            farm=str(record.get(KEY_BY_VI.get("Trại")) or "").strip()
-            region=str(record.get(KEY_BY_VI.get("Khu vực")) or "").strip()
-            if not year or not week or not farm:
-                errors.append(f"Thiếu Năm/Tuần/Trại: {farm}-{week}")
-                continue
-            ok,msg=save_record(
-                {"year":year,"month":month,"week":week,"region":region,"farm":farm},
-                record,user.get("email","unknown"),"Đã gửi"
+
+    can_import = not invalid_rows and not duplicates
+    confirm = st.checkbox(
+        "Tôi đã kiểm tra dữ liệu và đồng ý nhập toàn bộ vào hệ thống",
+        disabled=not can_import,
+        key="confirm_multi_user_excel_import",
+    )
+
+    if st.button(
+        "NHẬP TOÀN BỘ DỮ LIỆU",
+        type="primary",
+        use_container_width=True,
+        disabled=not (confirm and can_import),
+        key="run_multi_user_excel_import",
+    ):
+        total = len(rows)
+        progress = st.progress(0)
+        status_box = st.empty()
+
+        ok_count = 0
+        errors = []
+        created_by = user.get("email", "unknown")
+
+        for index, (record, source) in enumerate(zip(rows, row_sources), start=1):
+            status_box.info(
+                f"Đang lưu {index}/{total}: "
+                f"{source['farm']} – tuần {source['week']}"
             )
+
+            meta = {
+                "year": int(source["year"]),
+                "month": int(source["month"]),
+                "week": str(source["week"]),
+                "region": source["region"],
+                "farm": source["farm"],
+            }
+
+            ok, message = _save_record_with_retry(
+                meta=meta,
+                record=record,
+                created_by=created_by,
+                status="Đã gửi",
+                retries=3,
+            )
+
             if ok:
-                ok_count+=1
+                ok_count += 1
             else:
-                errors.append(msg)
+                errors.append(
+                    f"Dòng {source['excel_row']} – "
+                    f"{source['farm']} – tuần {source['week']}: {message}"
+                )
+
+            progress.progress(index / total)
+
+        status_box.empty()
+
         if errors:
-            st.warning(f"Đã nhập {ok_count} dòng; lỗi {len(errors)} dòng. Lỗi đầu tiên: {errors[0]}")
+            st.warning(
+                f"Đã nhập thành công {ok_count}/{total} dòng; "
+                f"có {len(errors)} dòng lỗi."
+            )
+            with st.expander("Chi tiết các dòng lỗi", expanded=True):
+                for error in errors:
+                    st.write(f"- {error}")
         else:
-            st.success(f"Đã nhập thành công {ok_count} dòng với toàn bộ {len(FIELD_DEFS)} cột.")
+            st.success(
+                f"Đã nhập thành công toàn bộ {ok_count} dòng. "
+                "Các trại được lưu độc lập."
+            )
+
+        st.cache_data.clear()
 
 def records_page(user):
     st.header("Dữ liệu và báo cáo")
